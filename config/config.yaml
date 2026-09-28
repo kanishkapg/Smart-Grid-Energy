@@ -1,0 +1,132 @@
+# ===========================================================================
+#  Single source of truth for every tunable in the pipeline.
+#
+#  Anything an examiner might ask "where does that number come from?" about
+#  lives here, not scattered across the jobs. Producers, the Spark jobs, the
+#  Airflow DAG and the API all load this same file.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Simulated clock
+#
+# 1 simulated day = 300 real seconds (5 real minutes)  ->  compression 288x.
+# A meter emits every 2 real seconds, so:
+#     readings per meter per simulated day = 300 / 2         = 150
+#     simulated time covered by one reading = 86400 / 150    = 576 s = 9.6 min
+#
+# This matters for window sizing: a "1 minute" window in simulated time would
+# be smaller than the gap between two readings and would mostly be empty. The
+# windows below are therefore expressed in SIMULATED minutes and chosen to
+# contain several readings per meter.
+# ---------------------------------------------------------------------------
+simulation:
+  sim_day_real_seconds: 300        # 5 real minutes per simulated day
+  meter_interval_seconds: 2        # real-time emit cadence per meter
+  sim_epoch_start: "2026-01-01T00:00:00+05:30"   # simulated wall clock at t=0
+  timezone: "Asia/Colombo"
+
+# ---------------------------------------------------------------------------
+# Grid topology
+# ---------------------------------------------------------------------------
+grid:
+  zones:
+    - name: Colombo-North
+      meters: 12
+      solar_penetration: 0.75      # fraction of households with rooftop PV
+      base_load_kw: 1.10           # mean household draw used by the simulator
+    - name: Colombo-South
+      meters: 10
+      solar_penetration: 0.60
+      base_load_kw: 1.25
+    - name: Gampaha
+      meters: 9
+      solar_penetration: 0.45
+      base_load_kw: 0.95
+    - name: Kandy
+      meters: 9
+      solar_penetration: 0.30
+      base_load_kw: 0.85
+
+  # Household / meter id formats. One meter per household in this model.
+  meter_id_prefix: "M-"
+  household_id_prefix: "H-"
+
+# ---------------------------------------------------------------------------
+# Kafka
+# ---------------------------------------------------------------------------
+kafka:
+  topic_readings: "meter.readings"
+  partitions: 3
+  # Keyed by household_id: gives an even spread across partitions. Keying by
+  # grid_zone would put 12 of 40 meters on one partition (hot-spot); zone
+  # aggregation is Spark's job, not the partitioner's.
+  partition_key: "household_id"
+  producer_acks: "all"
+
+# ---------------------------------------------------------------------------
+# Object storage layout (S3-compatible; SeaweedFS locally)
+# ---------------------------------------------------------------------------
+storage:
+  bucket_raw: "raw"
+  bucket_tariff: "tariff"
+  bucket_reports: "reports"
+  raw_prefix: "meter_readings"     # raw/meter_readings/sim_day=.../grid_zone=...
+  raw_partition_cols: ["sim_day", "grid_zone"]
+  tariff_filename_pattern: "tariff_{sim_day}.csv"   # sim_day as YYYYMMDD
+
+# ---------------------------------------------------------------------------
+# Speed layer (Spark Structured Streaming) -- values in SIMULATED time
+# ---------------------------------------------------------------------------
+speed_layer:
+  window_minutes: 60               # 1 simulated hour  (~12.5 real seconds)
+  watermark_minutes: 30            # tolerate ~3 readings' worth of lateness
+  trigger_seconds: 5               # real-time micro-batch cadence
+  checkpoint_dir: "s3a://raw/_checkpoints/speed_layer"
+
+# ---------------------------------------------------------------------------
+# Alert thresholds
+# ---------------------------------------------------------------------------
+alerts:
+  # Daytime renewable contribution below this % raises a WARN.
+  low_renewable_pct: 15.0
+  daytime_start_hour: 6            # simulated local hour, inclusive
+  daytime_end_hour: 18             # simulated local hour, exclusive
+  # Zone load above this many kW in a window raises a WARN (overload proxy).
+  zone_overload_kw: 45.0
+  # Health check: no readings at all for this many real seconds -> CRITICAL.
+  no_data_real_seconds: 30
+
+# ---------------------------------------------------------------------------
+# Billing (batch layer). Worked example from the project plan:
+#   H-101: consumption 18 kWh, solar 6 kWh, rate 45, subsidy on
+#   net = max(18-6,0) = 12 ; gross = 540 ; subsidy = 54 ; net_amount = 486
+# ---------------------------------------------------------------------------
+billing:
+  currency: "LKR"
+  # Net metering, import-only: exported surplus is not paid out, it just
+  # cannot push the billable units below zero.
+  net_metering: "import_only"
+  subsidy_pct: 0.10
+  tiers:
+    domestic-1:
+      rate: 30.0
+    domestic-2:
+      rate: 45.0
+    domestic-3:
+      rate: 62.0
+  tier_weights:                    # how the generator assigns tiers
+    domestic-1: 0.35
+    domestic-2: 0.45
+    domestic-3: 0.20
+  subsidy_probability: 0.30        # share of households flagged for subsidy
+  rate_jitter_pct: 0.05            # +/- 5% daily variation on the tier rate
+
+# ---------------------------------------------------------------------------
+# Logging / observability
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  format: "json"                   # structlog JSON renderer
+  # Every component stamps this correlation id on each log line and on the
+  # rows it writes, so serving-layer data is traceable to a pipeline run.
+  run_id_env_var: "SG_RUN_ID"

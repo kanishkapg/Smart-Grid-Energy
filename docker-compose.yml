@@ -1,0 +1,189 @@
+# ===========================================================================
+#  Smart Grid Energy Monitoring & Billing  --  Lambda Architecture stack
+#
+#  Phase 0 brings up the three infrastructure pillars:
+#    kafka      -> ingestion bus              (speed layer entry point)
+#    seaweedfs  -> S3-compatible object store (raw master store + tariff drop)
+#    postgres   -> serving layer              (zone_metrics, daily_bill, alerts)
+#
+#  Later phases add: spark, airflow, fastapi, grafana, prometheus.
+# ===========================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-smartgrid}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Kafka in KRaft mode: one node acting as both broker and controller, so no
+  # Zookeeper container is needed.
+  #
+  # Deliberately NOT persisted to a named volume: in a Lambda architecture Kafka
+  # is a transport buffer, not the system of record. The immutable master
+  # dataset lives as Parquet in object storage (Phase 2), so a broker restart
+  # losing buffered events is acceptable -- and it keeps this file free of the
+  # volume-ownership problems the Kafka image has on Windows hosts.
+  # -------------------------------------------------------------------------
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    container_name: sg-kafka
+    hostname: kafka
+    logging: *default-logging
+    ports:
+      - "29092:29092"   # host-facing listener, for producers on your machine
+    environment:
+      # Must be a base64-encoded 16-byte UUID (22 chars), not a descriptive
+      # name -- KRaft formats its metadata log with it and refuses anything else.
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Empty host (`://:9092`) binds all interfaces. Writing 0.0.0.0 here fails:
+      # Kafka derives advertised.listeners for any listener not named in
+      # KAFKA_ADVERTISED_LISTENERS -- the CONTROLLER one -- from this value, and
+      # rejects 0.0.0.0 as a nonroutable meta-address.
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # Single-broker cluster -> every replication factor must be 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics are created by kafka-init
+      KAFKA_LOG_RETENTION_HOURS: 24
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # One-shot: create the meter-readings topic, then exit 0.
+  # Partitioned by household_id (see config/config.yaml) for an even key spread.
+  # -------------------------------------------------------------------------
+  kafka-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    container_name: sg-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      TOPIC: ${KAFKA_TOPIC_READINGS:-meter.readings}
+      PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-3}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic "$$TOPIC" \
+          --partitions "$$PARTITIONS" --replication-factor 1
+        echo "--- topics now on the broker ---"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$TOPIC"
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # SeaweedFS: S3-compatible object storage.
+  #   raw/     -> immutable Parquet master dataset (Phase 2)
+  #   tariff/  -> the once-per-simulated-day tariff CSV drop (Phase 1)
+  #   reports/ -> generated daily billing reports (Phase 4)
+  #
+  # Why not MinIO: MinIO withdrew its public container images, so `minio/minio`
+  # and `quay.io/minio/minio` can no longer be pulled without a licence. The
+  # code only ever speaks the S3 API, so replacing the provider was a change to
+  # this file -- see docs/02-tech-stack.md.
+  #
+  # `server -s3 -filer` runs master, volume, filer and the S3 gateway in one
+  # process, which is what keeps this a single container.
+  # -------------------------------------------------------------------------
+  seaweedfs:
+    image: ${S3_IMAGE:-chrislusf/seaweedfs:3.80}
+    container_name: sg-seaweedfs
+    hostname: seaweedfs
+    logging: *default-logging
+    command: >
+      server -dir=/data -s3 -filer
+      -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=256
+    ports:
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # filer web UI: browse buckets and objects
+    volumes:
+      - seaweed-data:/data
+      # Without this the S3 gateway accepts any access key, making the
+      # credentials in .env decorative.
+      - ./infra/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    # No healthcheck: the image ships the `weed` binary and little else, so any
+    # in-image HTTP probe is guesswork. Readiness is gated by storage-init's
+    # own retry loop below, which uses a container that definitely has a client.
+
+  # -------------------------------------------------------------------------
+  # One-shot: wait for the S3 gateway, create the three buckets, then exit 0.
+  # Anything in a later phase that needs the buckets should depend on this with
+  # `condition: service_completed_successfully`.
+  # -------------------------------------------------------------------------
+  storage-init:
+    image: ${AWSCLI_IMAGE:-amazon/aws-cli:latest}
+    container_name: sg-storage-init
+    depends_on:
+      seaweedfs:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-smartgrid}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-smartgridsecret}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://seaweedfs:8333}
+      BUCKETS: ${S3_BUCKET_RAW:-raw} ${S3_BUCKET_TARIFF:-tariff} ${S3_BUCKET_REPORTS:-reports}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until aws s3 ls --endpoint-url "$$S3_ENDPOINT" >/dev/null 2>&1; do
+          echo "waiting for the S3 gateway..."; sleep 3
+        done
+        for b in $$BUCKETS; do
+          aws s3 mb "s3://$$b" --endpoint-url "$$S3_ENDPOINT" 2>/dev/null \
+            || echo "bucket $$b already exists"
+        done
+        echo "--- buckets now in object storage ---"
+        aws s3 ls --endpoint-url "$$S3_ENDPOINT"
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL: the Lambda serving layer. Both the speed layer and the batch
+  # layer write here, and both FastAPI and Grafana read from here.
+  # The schema is applied once, on first start, from infra/postgres/init/.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: sg-postgres
+    hostname: postgres
+    logging: *default-logging
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  seaweed-data:
+  postgres-data:

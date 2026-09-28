@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# Host-side Python dependencies (producers, API, tests, helper scripts).
+# Spark and Airflow run in their own containers with their own dependencies.
+#
+#   python -m venv .venv
+#   .venv\Scripts\Activate.ps1          # PowerShell
+#   pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+# Config
+PyYAML==6.0.2
+
+# Phase 1 -- simulated sources
+# NOTE: 2.0.2 is the version most tutorials pin, but it is broken on Python
+# 3.12 -- its vendored six.moves shim fails on import. 3.0.11 fixes that.
+kafka-python==3.0.11           # pure-Python producer: no C toolchain on Windows
+boto3==1.35.36                 # S3 client for MinIO (tariff + report drops)
+
+# Structured logging (rubric: JSON logs + correlation ids)
+structlog==24.4.0
+
+# Phase 3 -- serving layer
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+psycopg[binary]==3.2.3         # binary wheel: no local libpq build needed
+prometheus-client==0.21.0
+
+# Phase 7 -- tests
+pytest==8.3.3

@@ -25,6 +25,14 @@ simulation:
   sim_epoch_start: "2026-01-01T00:00:00+05:30"   # simulated wall clock at t=0
   timezone: "Asia/Colombo"
 
+  # A small share of readings carry an older event time, as a real meter network
+  # would when a device buffers and retries. This is what gives the speed layer's
+  # watermark an actual job. Kept below speed_layer.watermark_minutes so these
+  # events are still counted rather than discarded as too late; config validation
+  # enforces that relationship.
+  late_event_probability: 0.03
+  late_event_max_sim_minutes: 20
+
 # ---------------------------------------------------------------------------
 # Grid topology
 # ---------------------------------------------------------------------------
@@ -47,9 +55,23 @@ grid:
       solar_penetration: 0.30
       base_load_kw: 0.85
 
-  # Household / meter id formats. One meter per household in this model.
+  # Household / meter id formats. One meter per household in this model, so
+  # H-101 is metered by M-101. Numbering starts at 101 to match the worked
+  # example in the project plan.
   meter_id_prefix: "M-"
   household_id_prefix: "H-"
+
+  # Rooftop PV capacity for a household that has panels.
+  #
+  # Sized deliberately, not picked for realism alone. A real 3 kWp rooftop on a
+  # ~1.1 kW household exports heavily at midday, which drove zone renewable_pct
+  # to 131% -- physically valid, but it makes "renewable contribution" unreadable
+  # as a percentage and puts the 15% low-renewable alert permanently out of
+  # reach. At 0.9 kW even the highest-penetration zone stays under 100% at solar
+  # noon, and a solar household's daily totals land near the project plan's
+  # worked example for H-101 (about 18 kWh consumed against 6 kWh generated).
+  solar_panel_kw: 0.9
+  load_jitter_pct: 0.25            # random variation applied to each reading
 
 # ---------------------------------------------------------------------------
 # Kafka

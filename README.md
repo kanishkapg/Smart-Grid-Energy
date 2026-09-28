@@ -66,8 +66,8 @@ events.
 | Phase | Delivers | Visible outcome | State |
 |---|---|---|---|
 | **0** | Infra: Kafka (KRaft), MinIO, Postgres + serving schema | `scripts/stack_status.py` prints a green checkpoint | ✅ |
-| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 33 passing | ✅ |
-| 1 | Simulated sources: meter stream → Kafka, tariff CSV → MinIO | live JSON events on the topic; a tariff file per sim-day | ⏳ next |
+| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 65 passing | ✅ |
+| **1** | Simulated sources: meter stream → Kafka, tariff CSV → object storage | `scripts/check_phase1.py` prints a green checkpoint | ✅ |
 | 2 | Raw master store: streaming sink → partitioned Parquet | Parquet row count ≈ events produced | ⏳ |
 | 3 | Speed layer + FastAPI real-time API | `/zones` returns live figures; forced low solar fires an alert | ⏳ |
 | 4 | Batch billing + Airflow DAG | green DAG run; hand-calculated bill matches `daily_bill` | ⏳ |
@@ -160,6 +160,134 @@ docker compose down -v       # also wipe Postgres + MinIO data (full reset)
 
 ---
 
+## Verifying Phase 1, step by step
+
+Phase 1 adds the two simulated sources. Phase 0's stack must be up first.
+
+You need **three terminals**, each with the environment activated
+(`conda activate bigdata`) and sitting in the project root.
+
+### Terminal 1 — the meter stream
+
+```powershell
+python -m sources.stream_producer --log-format console
+```
+
+**Expect** a `starting` line stating the simulated clock, then `producer_ready`,
+then a `progress` line every ~20 seconds:
+
+```
+[info] producer_ready   bootstrap=localhost:29092 meters=40 solar_meters=22 topic=meter.readings
+[info] progress         events_sent=400 late_events=17 events_per_sec=22.2
+                        sim_time=2026-01-01T18:58:23+05:30 sim_day_progress_pct=79.1
+```
+
+40 meters × one reading every 2 s ≈ **20 events/second**. `late_events` should be
+roughly 3% of the total — those are deliberately backdated (see below). Leave it
+running; Ctrl+C stops it cleanly.
+
+Useful flags: `--sim-days 2` to stop after two simulated days, `--cloud-cover 0.9`
+to suppress solar and force the low-renewable alert (used in Phase 3),
+`--log-format json` for the machine-readable form.
+
+### Terminal 2 — the daily tariff file
+
+```powershell
+python -m sources.tariff_generator --log-format console
+```
+
+**Expect** it to write the current simulated day immediately, then wait and write
+one file per sim-day boundary — a new file every 5 real minutes:
+
+```
+[info] tariff_file_written              key=tariff_20260101.csv households=40 subsidised=12
+[info] watching_for_sim_day_boundaries  next_boundary_in_real_seconds=5.0
+[info] tariff_file_written              key=tariff_20260102.csv households=40 subsidised=12
+```
+
+`--once` writes today's file and exits; `--sim-day 20260103` regenerates a
+specific day, which reproduces that day's file byte for byte.
+
+### Terminal 3 — the checkpoint
+
+```powershell
+python scripts\check_phase1.py
+```
+
+**Expect** `PHASE 1 CHECKPOINT: PASSED`, with a per-zone table:
+
+```
+  sim day 2026-01-02 (35% elapsed), sim time 2026-01-02T08:17:13+05:30
+
+  Meter stream         (sampling up to 120 events)
+      + 120 events validated against the event contract
+
+      zone             events  meters  kWh used  kWh solar  renew %
+      Colombo-North        36      12     6.189      1.702    27.5%
+      Colombo-South        30      10     5.586      0.943    16.9%
+      Gampaha              27       9     3.874      0.641    16.5%
+      Kandy                27       9     3.396      0.472    13.9%
+
+      + daylight in simulated time, so solar generation is expected
+      + 5 of 120 events arrived out of event-time order -- this is what the
+        speed layer's 30-simulated-minute watermark absorbs
+
+  Daily tariff file
+      + 2 tariff file(s) in 'tariff': tariff_20260101.csv, tariff_20260102.csv
+      + tariff_20260102.csv: header correct, 40 household rows
+        H-101,30.73,domestic-1,false
+```
+
+**Reading the output.** `renew %` swings with simulated time and that is the
+point: 0% overnight, climbing through the morning, peaking near midday, back to
+0% after sunset. **`0.000 kWh solar` at night is correct, not a fault** — the
+script says which it is, so you can tell a quiet night from a broken producer.
+Over a whole simulated day each zone lands at 14–24% renewable.
+
+### Seeing it yourself, without the script
+
+```powershell
+# raw events straight off the topic
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server kafka:9092 --topic meter.readings --max-messages 5
+
+# tariff files in object storage
+docker compose run --rm --no-deps --entrypoint /bin/sh storage-init -c "aws s3 ls s3://tariff --endpoint-url $S3_ENDPOINT"
+
+# read one tariff file
+docker compose run --rm --no-deps --entrypoint /bin/sh storage-init -c "aws s3 cp s3://tariff/tariff_20260101.csv - --endpoint-url $S3_ENDPOINT"
+```
+
+A raw event looks exactly like the documented contract:
+
+```json
+{"meter_id": "M-104", "household_id": "H-104", "grid_zone": "Colombo-North",
+ "power_consumption_kwh": 0.0932, "solar_generation_kwh": 0.0,
+ "timestamp": "2026-01-03T04:50:12.435173+05:30"}
+```
+
+You can also browse **http://localhost:8888/buckets/tariff/** to see the CSVs
+accumulating, one per simulated day.
+
+### What Phase 1 models, and why
+
+| Decision | Reason |
+|---|---|
+| Messages keyed by `household_id` | Even spread over 3 partitions. Keying by `grid_zone` would put 12 of 40 meters on one partition. |
+| `run_id` in a Kafka **header**, not the payload | It is metadata about the pipeline run, not part of the meter-reading contract. |
+| ~3% of events deliberately backdated | Gives the speed layer's watermark a real job instead of a decorative one. Capped below the watermark, and `common/config.py` refuses to start if that relationship is violated. |
+| Solar ownership by **quota**, not a coin flip per household | With 9–12 meters per zone, independent draws vary wildly — Kandy came out with 0 of 9 panels against a 0.30 target, which would have pinned its renewable share at 0% and made the alert fire forever. |
+| Tier and subsidy hashed from `household_id` | Stable across days and identical in every process, with no coordination. H-101 is on the same tier in every file. |
+| Tariff **rate** varies daily, seeded by (household, day) | A published daily tariff should move — but regenerating a past day must reproduce it exactly, so the batch layer can recompute. |
+| Rooftop PV sized at 0.9 kW | A realistic 3 kW array exported so heavily at midday that zone `renewable_pct` hit 131% — valid physics, but it makes the metric unreadable and puts the 15% alert out of reach. At 0.9 kW a solar household's day lands near the plan's H-101 example (21.6 kWh used, 6.9 kWh solar). |
+
+> **For the report:** quote the figures the system actually produces, not the
+> plan's illustrative ones. H-101 really is a solar household, but it lands on
+> `domestic-1` at ~30 LKR/kWh with no subsidy, where the plan's example assumed
+> `domestic-2` at 45 with a subsidy.
+
+---
+
 ## What Phase 0 stood up
 
 | Service | Host endpoint | Purpose |
@@ -200,11 +328,16 @@ Three deliberate choices worth knowing:
 ├─ config/config.yaml          # single source of truth for every tunable
 ├─ infra/postgres/init/        # serving schema, applied on first boot
 ├─ infra/seaweedfs/s3.json     # S3 identity, so credentials are enforced
-├─ common/                     # config, JSON logging, simulated clock
+├─ common/                     # config, JSON logging, simulated clock, S3 client
 ├─ docs/                       # ADR, diagrams, tech-stack justification
-├─ scripts/stack_status.py     # Phase 0 checkpoint verifier
-├─ tests/                      # foundation tests (no Docker required)
-├─ sources/                    # Phase 1: stream producer, tariff generator
+├─ scripts/
+│  ├─ stack_status.py          # Phase 0 checkpoint verifier
+│  └─ check_phase1.py          # Phase 1 checkpoint verifier
+├─ tests/                      # 65 tests, no Docker required
+├─ sources/
+│  ├─ meter_model.py           # meter population + reading physics (pure, tested)
+│  ├─ stream_producer.py       # meter events -> Kafka
+│  └─ tariff_generator.py      # daily tariff CSV -> object storage
 ├─ processing/                 # Phase 2-4: common/ speed/ batch/
 ├─ orchestration/dags/         # Phase 4: Airflow billing DAG
 ├─ serving/api/                # Phase 3: FastAPI app
@@ -227,3 +360,6 @@ Three deliberate choices worth knowing:
 | `pull access denied for minio/minio` | An old `.env` still pins a MinIO image. Re-copy `.env.example`. |
 | `ModuleNotFoundError: kafka.vendor.six.moves` | `kafka-python` 2.0.2 is broken on Python 3.12. `requirements.txt` pins 3.0.11. |
 | Components disagree about the sim-day | They share an anchor in `data/.sim_anchor`. Delete it to restart at sim-day 0, or set `SG_REAL_ANCHOR` to pin it. |
+| `check_phase1.py` says "no events arrived" | The producer isn't running. Start `python -m sources.stream_producer` in another terminal first. |
+| `ModuleNotFoundError: No module named 'common'` | Run from the project root with the environment activated. Scripts in `scripts/` add the root to `sys.path` themselves; `python -m sources.x` needs the root as your working directory. |
+| All zones show 0% renewable | Check the simulated hour in the header line. Overnight that is correct — `check_phase1.py` states whether it is day or night. |

@@ -83,6 +83,10 @@ class Config:
     def billing(self) -> dict[str, Any]:
         return self.raw["billing"]
 
+    @property
+    def logging(self) -> dict[str, Any]:
+        return self.raw["logging"]
+
     # -- derived simulated-clock facts, quoted in the README and the report --
     @property
     def compression_factor(self) -> float:
@@ -187,11 +191,23 @@ def validate(cfg: Config) -> None:
 
     # A watermark shorter than the gap between readings classifies perfectly
     # ordinary events as late and drops them.
-    if float(cfg.speed_layer["watermark_minutes"]) < cfg.sim_minutes_per_reading:
+    watermark = float(cfg.speed_layer["watermark_minutes"])
+    if watermark < cfg.sim_minutes_per_reading:
         raise ValueError(
             "config.yaml: speed_layer.watermark_minutes is shorter than the "
             f"{cfg.sim_minutes_per_reading:.1f} simulated-minute gap between readings; "
             "valid events would be dropped as late"
+        )
+
+    # The producer deliberately backdates a few events. If it can backdate them
+    # further than the watermark tolerates, the speed layer silently drops data
+    # that the batch layer still counts, and the two layers disagree for reasons
+    # that look like a bug rather than a setting.
+    if float(cfg.simulation["late_event_max_sim_minutes"]) > watermark:
+        raise ValueError(
+            "config.yaml: simulation.late_event_max_sim_minutes exceeds "
+            "speed_layer.watermark_minutes; the producer would emit events the "
+            "speed layer must discard"
         )
 
 

@@ -139,13 +139,55 @@ spark:
 # Alert thresholds
 # ---------------------------------------------------------------------------
 alerts:
-  # Daytime renewable contribution below this % raises a WARN.
-  low_renewable_pct: 15.0
+  # --- the simulated solar day ---------------------------------------------
+  # Sunrise and sunset for the producer's irradiance curve. Not a threshold;
+  # it lives here because the low-renewable rule below is derived from it.
   daytime_start_hour: 6            # simulated local hour, inclusive
   daytime_end_hour: 18             # simulated local hour, exclusive
-  # Zone load above this many kW in a window raises a WARN (overload proxy).
-  zone_overload_kw: 45.0
-  # Health check: no readings at all for this many real seconds -> CRITICAL.
+
+  # --- rule: low renewable contribution ------------------------------------
+  # A zone window whose renewable share falls below this raises a WARN.
+  low_renewable_pct: 15.0
+
+  # Checked only over the hours either side of solar noon, not the whole
+  # daylight span. A 06:00-07:00 window genuinely sits near 0% renewable
+  # because the sun has only just risen, so testing all of 06:00-18:00 would
+  # fire this rule at dawn and dusk every simulated day and the alert would
+  # carry no information. Between 09:00 and 16:00 even the lowest-penetration
+  # zone (Kandy, 30%) stays above 20%, so a breach there really does mean cloud
+  # cover or a PV fault -- which is what the producer's --cloud-cover simulates.
+  renewable_check_start_hour: 9    # simulated local hour, inclusive
+  renewable_check_end_hour: 16     # simulated local hour, exclusive
+
+  # --- rule: zone overload -------------------------------------------------
+  # Mean household draw in a zone window, in kW, above which the feeder is
+  # treated as stressed. Normalised per meter rather than a flat per-zone kW
+  # figure because the zones differ in size: 12 meters in Colombo-North against
+  # 9 in Kandy, so one absolute threshold would be unreachable for the small
+  # zones and trivial for the large ones.
+  #
+  # Calibrated against the simulator's own peak, not against base_load_kw. The
+  # meter model multiplies base load by a daily demand curve (_HOURLY_LOAD in
+  # sources/meter_model.py) that reaches 1.50 at the 19:00 evening peak, so the
+  # heaviest zone's honest maximum is:
+  #
+  #     1.25 kW base  x  1.50 peak  =  1.875 kW/meter
+  #     + residual jitter over ~6 readings per window (about +10%)  =  ~2.06
+  #
+  # 2.2 sits above that. Measured against five simulated days of live data the
+  # highest window any zone actually reached was 2.062 kW/meter, so the ceiling
+  # keeps about 7% of headroom: the rule stays quiet through the ordinary evening
+  # peak and trips only on an unusually heavy one, which is what a feeder-capacity
+  # alert should mean.
+  #
+  # The first draft used 1.6 -- derived from base_load_kw alone, ignoring the
+  # demand curve -- and it fired for the two largest zones every simulated
+  # evening, which is a calendar rather than an alert. Lower it to ~1.0 to watch
+  # the rule fire during a demo.
+  zone_overload_kw_per_meter: 2.2
+
+  # --- rule: health check (Phase 6) ----------------------------------------
+  # No readings at all for this many real seconds -> CRITICAL.
   no_data_real_seconds: 30
 
 # ---------------------------------------------------------------------------

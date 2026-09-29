@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -171,12 +172,35 @@ class Config:
 
     @property
     def postgres_dsn(self) -> str:
-        host = os.environ.get("POSTGRES_HOST", "postgres" if self.in_docker else "localhost")
+        """libpq connection string for the serving database.
+
+        Split host names the same way Kafka and S3 are: inside the compose
+        network Postgres answers to its service name, from the host it answers
+        on a published port. Reading POSTGRES_HOST in both cases looked right
+        and was not -- `.env` defines it as `postgres`, so a host-side script
+        would inherit a name that does not resolve outside Docker.
+        """
+        if self.in_docker:
+            host = os.environ.get("POSTGRES_HOST", "postgres")
+            port = os.environ.get("POSTGRES_PORT", "5432")
+        else:
+            host = os.environ.get("POSTGRES_EXTERNAL_HOST", "localhost")
+            # Its own setting, not POSTGRES_PORT: a PostgreSQL installed on the
+            # host often already owns 5432, so the stack may publish elsewhere.
+            port = os.environ.get("POSTGRES_EXTERNAL_PORT", "5432")
+        # The session time zone travels with the DSN so that every consumer --
+        # the API, the checkpoint scripts, psql through this string -- reads
+        # TIMESTAMPTZ columns back in the simulation's zone. Postgres otherwise
+        # renders them in the *client's* zone, so the same stored window would
+        # print as 09:00 on a Colombo laptop and 03:30 in a UTC container, and
+        # only one of those is the simulated hour the row is about.
+        options = quote(f"-c timezone={self.simulation['timezone']}", safe="")
         return (
             f"postgresql://{os.environ.get('POSTGRES_USER', 'grid')}"
             f":{os.environ.get('POSTGRES_PASSWORD', 'gridpass')}"
-            f"@{host}:{os.environ.get('POSTGRES_PORT', '5432')}"
+            f"@{host}:{port}"
             f"/{os.environ.get('POSTGRES_DB', 'smartgrid')}"
+            f"?options={options}"
         )
 
 

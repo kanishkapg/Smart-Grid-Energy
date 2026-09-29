@@ -66,14 +66,96 @@ events.
 | Phase | Delivers | Visible outcome | State |
 |---|---|---|---|
 | **0** | Infra: Kafka (KRaft), MinIO, Postgres + serving schema | `scripts/stack_status.py` prints a green checkpoint | ✅ |
-| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 65 passing | ✅ |
+| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 90 passing | ✅ |
 | **1** | Simulated sources: meter stream → Kafka, tariff CSV → object storage | `scripts/check_phase1.py` prints a green checkpoint | ✅ |
 | **2** | Raw master store: Spark Structured Streaming → partitioned Parquet | `scripts/check_phase2.py` reconciles Parquet against Kafka | ✅ |
-| 3 | Speed layer + FastAPI real-time API | `/zones` returns live figures; forced low solar fires an alert | ⏳ |
+| **3** | Speed layer (windowed zone metrics + alerts) + FastAPI real-time API | `scripts/check_phase3.py` prints a green checkpoint; `--cloud-cover` fires an alert | ✅ |
 | 4 | Batch billing + Airflow DAG | green DAG run; hand-calculated bill matches `daily_bill` | ⏳ |
 | 5 | Grafana dashboards | two rendering dashboards | ⏳ |
 | 6 | Observability hardening | kill the producer → "no data" alert fires | ⏳ |
 | 7 | Report, README, demo | clean-clone reproduce | ⏳ |
+
+---
+
+## Verifying everything, phase 0 → 3
+
+Each phase has its **own** checkpoint script, and running the Phase 3 one does not
+verify the earlier phases — the speed layer reads Kafka directly, so it can be
+perfectly healthy while the Parquet master store is empty or stalled. To check the
+platform end to end, run all four in order.
+
+### Terminals
+
+Only the long-running processes need a terminal of their own. The checkpoint
+scripts are one-shot and can share one.
+
+| Terminal | Command | Lifetime |
+|---|---|---|
+| 1 | `python -m sources.stream_producer --log-format console` | leave running throughout |
+| 2 | `python -m sources.tariff_generator --log-format console` | leave running throughout |
+| 3 | the checkpoint scripts below, one after another | returns each time |
+| 4 *(optional)* | `docker compose logs -f speed-layer` | blocks until Ctrl+C |
+
+Every terminal needs the environment activated (`conda activate bigdata`) and the
+project root as its working directory.
+
+### The sequence
+
+```powershell
+# --- once, in any terminal: bring the stack up ---------------------------
+docker compose up -d --build        # --build only on the first run or after a Dockerfile change
+
+# --- terminal 1 ----------------------------------------------------------
+python -m sources.stream_producer --log-format console
+
+# --- terminal 2 ----------------------------------------------------------
+python -m sources.tariff_generator --log-format console
+
+# --- terminal 3, in this order -------------------------------------------
+python -m pytest                    # 90 passing        (no Docker needed)
+python scripts\stack_status.py      # PHASE 0 CHECKPOINT: PASSED
+python scripts\check_phase1.py      # PHASE 1 CHECKPOINT: PASSED
+python scripts\check_phase2.py      # PHASE 2 CHECKPOINT: PASSED
+python scripts\check_phase3.py      # PHASE 3 CHECKPOINT: PASSED
+```
+
+### What each one proves, and how long to wait first
+
+| Step | Proves | Wait before running |
+|---|---|---|
+| `pytest` | The pure logic — simulated clock, meter physics, tariff generation, billing arithmetic, alert rules, config validation. No services touched. | none |
+| `stack_status.py` | Containers up, Kafka topic with 3 partitions, the four serving tables, both buckets. Waits for the `-init` jobs itself. | none |
+| `check_phase1.py` | Events on the topic match the event contract; a tariff CSV exists with 40 household rows. | ~20 s of producer, and one tariff file written |
+| `check_phase2.py` | Parquet row count reconciles against Kafka's offsets; partition layout is `sim_day/grid_zone`; duplicates are accounted for. | ~30 s (the raw sink commits every 15 s) |
+| `check_phase3.py` | Every zone is reporting fresh windows; window arithmetic is right; the API agrees with Postgres. | ~15 s (the first window closes after ~12.5 s) |
+
+Run them in order: a Phase 2 failure explains a Phase 3 failure, but not the other
+way round, and `check_phase3.py` will happily report a healthy speed layer while
+the master dataset the batch layer depends on is broken.
+
+### The alert demo, separately
+
+The Phase 3 checkpoint reports the alert log but does not require a breach,
+because in normal operation there is nothing to breach. To demonstrate one:
+
+```powershell
+# terminal 1: Ctrl+C, then
+python -m sources.stream_producer --cloud-cover 0.95 --log-format console
+
+# terminal 3, after a window inside 09:00-16:00 simulated (<= ~90 real seconds)
+python scripts\check_phase3.py --expect-alert low_renewable_contribution
+```
+
+### Shutting down
+
+```powershell
+docker compose down        # stops everything, keeps the data
+docker compose down -v     # also wipes Postgres, the buckets and the checkpoints
+```
+
+`./data/raw` is a host directory, so `down -v` does **not** remove the Parquet
+master store. Delete it by hand if you want a clean slate — and delete
+`data/.sim_anchor` too, which restarts the simulated clock at sim-day 0.
 
 ---
 
@@ -468,6 +550,282 @@ docker compose up -d raw-sink
 
 ---
 
+## Verifying Phase 3, step by step
+
+Phase 3 adds the **speed layer** and the **real-time API**. A second Spark
+Structured Streaming job reads `meter.readings`, aggregates it into event-time
+tumbling windows per grid zone, and upserts each window into `zone_metrics`;
+threshold rules append breaches to `alerts`. FastAPI serves both over HTTP.
+
+Two things are deliberately *not* here: no billing (that is the batch layer,
+Phase 4) and no analytics inside the API. The API only reads what the speed layer
+wrote — an API that recomputed the aggregation would be a second implementation
+free to disagree with the first.
+
+> **Latency, not exactness.** This is Lambda's speed layer, so it is allowed to
+> be approximate: meter counts use HyperLogLog because Spark rejects an exact
+> `count(distinct)` inside a streaming aggregation, and windows are published
+> while still open and corrected in place afterwards. Nothing here is
+> authoritative. Money is recomputed from Parquet in Phase 4.
+
+### Step 0 — one-time: the serving port may collide
+
+If you already run PostgreSQL locally, it owns `localhost:5432` — and on Windows
+Docker *also* binds 5432 without complaining, so host tools silently authenticate
+against your local server instead of the stack's. Set the published port aside in
+`.env` before starting:
+
+```
+POSTGRES_EXTERNAL_PORT=5433
+```
+
+Check with `netstat -ano | findstr ":5432"`: two LISTENING lines means a
+collision.
+
+### Step 1 — build and start everything
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+**Expect** six running services — `kafka`, `postgres`, `seaweedfs`, `raw-sink`,
+`speed-layer`, `api` (the last shown `healthy`) — plus `kafka-init` and
+`storage-init` as `exited (0)`.
+
+The first build adds `psycopg` to the Spark image and builds the API image. The
+`psycopg` layer sits *below* the connector jars in `infra/spark/Dockerfile` on
+purpose: a layer above them would invalidate the cache and re-download ~250 MB.
+
+### Step 2 — start the producer
+
+```powershell
+python -m sources.stream_producer --log-format console
+```
+
+Leave it running in its own terminal. Without it there is no stream, and the
+speed layer will sit idle producing no windows at all.
+
+### Step 3 — watch windows being committed
+
+```powershell
+docker compose logs -f speed-layer
+```
+
+**Expect** one `starting_query` line stating every threshold in force, then one
+`micro_batch` line per trigger (every 5 real seconds):
+
+```json
+{"component": "speed_layer", "window_minutes": 60, "watermark_minutes": 30,
+ "trigger_seconds": 5, "sim_minutes_per_real_second": 4.8,
+ "low_renewable_pct": 15.0, "renewable_check_hours": [9, 16],
+ "zone_overload_kw_per_meter": 2.2, "event": "starting_query"}
+{"component": "speed_layer", "batch_id": 149, "windows_upserted": 4,
+ "alerts_raised": 0, "newest_window": "2026-01-23T13:00:00+05:30",
+ "zones": ["Colombo-North", "Colombo-South", "Gampaha", "Kandy"],
+ "event": "micro_batch"}
+```
+
+Two things worth reading in that output:
+
+- **`windows_upserted` alternates between 4 and 8.** Four is the open window
+  being refreshed for four zones. Eight is a trigger that crossed a window
+  boundary, so the closing window and the new one are both written. That is
+  `update` output mode working as intended.
+- **`newest_window` carries `+05:30` and lands on the hour.** Spark aligns
+  event-time windows to midnight *UTC*, which in Asia/Colombo would put every
+  boundary at `HH:30`. `window_alignment_minutes()` in `common/sim_clock.py`
+  shifts the grid back onto the local hour — without it the alert rules, written
+  in local hours, would silently test 09:30–16:30 instead of 09:00–16:00.
+
+The Spark UI for this job is **http://localhost:4041** (`raw-sink` still has
+4040). Its *Structured Streaming* tab shows the watermark advancing and the
+number of state rows retained.
+
+### Step 4 — query the serving tables directly
+
+```powershell
+docker compose exec postgres psql -U grid -d smartgrid -c `
+  "SELECT window_start, grid_zone, total_consumption_kwh, renewable_pct, active_meters FROM zone_metrics ORDER BY window_start DESC LIMIT 8;"
+```
+
+**Expect** four rows per window, one per zone, newest first. Overnight windows
+show `renewable_pct = 0` — correct, not a fault. Around simulated midday the
+high-penetration zones reach 60–90%.
+
+### Step 5 — the API
+
+```powershell
+curl http://localhost:8000/health
+curl http://localhost:8000/zones
+curl "http://localhost:8000/zones/Colombo-North/load?windows=5"
+curl "http://localhost:8000/alerts?limit=5"
+curl http://localhost:8000/metrics
+```
+
+Or open **http://localhost:8000/docs** for the generated OpenAPI page, which is
+the easiest thing to show in a demo.
+
+`/health` separates two questions that are usually collapsed into one:
+
+```json
+{"status": "ok", "database": "reachable", "data_fresh": true,
+ "seconds_since_last_write": 5.3, "freshness_threshold_seconds": 30.0,
+ "windows_stored": 240, "zones_reporting": 4,
+ "newest_window_start": "2026-01-23T11:00:00+05:30", "zones_configured": 4,
+ "run_id": "api-20260929T033506-ec4674"}
+```
+
+Stop the producer and `data_fresh` flips to `false` while the status code stays
+200 — the API is healthy and correctly reporting that its upstream has stopped.
+Only an unreachable database is a 503. Phase 6 turns that flag into a firing
+health-check alert.
+
+`/zones` returns the newest **complete** window per zone:
+
+```json
+{"window_complete": true, "zone_count": 4,
+ "grid_total_consumption_kwh": 29.5278, "grid_total_solar_kwh": 0.8809,
+ "grid_renewable_pct": 2.98,
+ "zones": [{"window_start": "2026-01-23T13:00:00+05:30",
+            "window_end": "2026-01-23T14:00:00+05:30",
+            "grid_zone": "Colombo-North", "total_consumption_kwh": 8.8107,
+            "total_solar_kwh": 0.3501, "renewable_pct": 3.97,
+            "active_meters": 12, "avg_load_kw": 8.811,
+            "updated_at": "2026-09-29T09:12:16.564851+05:30"}]}
+```
+
+The window in progress is excluded because the speed layer rewrites it on every
+micro-batch, so serving it raw would show consumption climbing from zero each
+time a window opened. One window of latency is 12.5 real seconds at 288x. Pass
+`?include_open=true` to see it anyway.
+
+Note which timestamps are which: `window_start`/`window_end` are **simulated**
+instants, `updated_at` is **real** time. It is the only real clock in the row,
+which is why the freshness check reads it.
+
+### Step 6 — run the checkpoint
+
+```powershell
+python scripts\check_phase3.py
+```
+
+This is the plan's checkpoint. It reads Postgres and the API *independently* and
+compares them, because the failure worth catching is not a dead API — it is a
+live-looking dashboard served from a stale or wrongly-joined query.
+
+```
+  Serving tables       [PASS]
+      + zone_metrics holds 236 window row(s)
+      + alerts holds 8 row(s)
+      + pipeline_runs has 4 speed_layer run(s) registered
+
+  Zone coverage        [PASS]
+      grid_zone         renewable%    meters   age(s)  newest window (simulated)
+      + Colombo-North          3.6        12      3.3  2026-01-23 10:00
+      + Colombo-South          2.7        10      3.3  2026-01-23 10:00
+      + Gampaha                2.6         9      3.3  2026-01-23 10:00
+      + Kandy                  2.2         9      3.3  2026-01-23 10:00
+      + all 4 configured zone(s) present
+      + rows written within 45s (no_data_real_seconds + 15s slack)
+
+  Window arithmetic    [PASS]
+      + 200 window(s) checked, all 60 simulated minutes long
+      + renewable_pct matches solar/consumption in every row
+      + active_meters never exceeds the 40 configured meters
+
+  API endpoints        [PASS]
+      + /health   status=ok data_fresh=True last_write=3.4s ago
+      + /zones    4 zone(s), grid load 32.72 kWh/window, renewable 2.4%
+      + /zones agrees with the newest complete window in Postgres
+      + /zones/Colombo-North/load returned 5 window(s), newest first
+      + unknown zone: 404 as expected
+
+  PHASE 3 CHECKPOINT: PASSED
+```
+
+**Window arithmetic** is the check that would catch a genuinely wrong
+aggregation. That every window is exactly 60 simulated minutes proves the job
+grouped on event time rather than processing time; recomputing `renewable_pct`
+from the stored totals proves the served percentage came from the served numbers.
+
+### Step 7 — make an alert fire
+
+The plan's checkpoint asks for this explicitly: *forcing low solar in the
+producer makes a low-renewable alert appear.* Restart the producer with heavy
+cloud cover:
+
+```powershell
+# Ctrl+C the running producer first
+python -m sources.stream_producer --cloud-cover 0.95 --log-format console
+```
+
+Then wait for a window inside **09:00–16:00 simulated** — at most ~90 real
+seconds — and watch:
+
+```powershell
+docker compose logs -f speed-layer
+```
+
+**Expect** one `alert` line per zone per window:
+
+```json
+{"component": "speed_layer", "rule": "low_renewable_contribution",
+ "grid_zone": "Kandy", "level": "warning",
+ "message": "Low renewable contribution, Kandy: 2.2% (floor 15%) at 2026-01-23 14:00 simulated",
+ "window_start": "2026-01-23T14:00:00+05:30", "event": "alert"}
+```
+
+and then confirm it end to end:
+
+```powershell
+python scripts\check_phase3.py --expect-alert low_renewable_contribution
+curl "http://localhost:8000/alerts?rule=low_renewable_contribution&limit=5"
+```
+
+**One alert per zone per window, not one per micro-batch.** An open window is
+re-emitted every 5 seconds, so the same breach is evaluated a dozen times before
+the window closes. `Alert.dedupe_key` — `(rule, zone, window_start)` — is the
+identity of the *condition*, and the sink keeps the keys it has already written.
+
+Stop the cloud cover and the alerts stop with the next window: solar recovers to
+60–90% around midday and the rule falls silent.
+
+### Restarting cleanly
+
+The checkpoint holds both the Kafka offsets and the open windows' state, so a
+plain restart resumes mid-window. Changing the **window size or the watermark**
+changes the query plan, which Structured Streaming cannot resume across — clear
+the checkpoint or the job will fail to start:
+
+```powershell
+docker compose stop speed-layer
+docker compose run --rm --no-deps --entrypoint sh speed-layer -c "rm -rf /checkpoints/speed_layer"
+docker compose exec postgres psql -U grid -d smartgrid -c "TRUNCATE zone_metrics, alerts;"
+docker compose up -d speed-layer
+```
+
+Only `speed_layer`'s checkpoint is removed — `raw-sink`'s lives beside it and the
+master dataset is untouched.
+
+### What Phase 3 decides, and why
+
+| Decision | Reason |
+|---|---|
+| Aggregation lives in `processing/shared/transforms.py` | The concrete answer to Lambda's standard criticism. The speed layer groups by (window, zone) and the batch layer will group by (sim_day, household) — different questions, one piece of arithmetic, imported by both. |
+| `update` output mode, not `append` | `append` emits a window once and only after the watermark has passed it, so a dashboard shows nothing about the window in progress. `update` re-emits changed windows, which is only safe because `zone_metrics` is keyed on `(window_start, grid_zone)` and the sink upserts. |
+| Approximate meter counts in the speed layer | Spark rejects an exact `count(distinct)` in a streaming aggregation — exactness would mean retaining every meter id in each open window's state. So the speed layer is approximate and the batch layer is exact, which is the accuracy split the architecture decision argues for, showing up in the code. At 9–12 meters per zone HyperLogLog is exact anyway. |
+| Writes go through **psycopg**, not Spark's JDBC writer | Every write has to be an idempotent upsert, and JDBC cannot express `ON CONFLICT DO UPDATE`: `append` hits the primary key, `overwrite` drops the table. The sink collects each micro-batch — 4–12 rows — and upserts it. Honest limit: this puts every row through the driver, so a production volume would need a staging-table merge instead. |
+| A fresh connection per micro-batch | ~2 ms against a local Postgres, against a long-lived connection that would have to survive every Postgres restart and idle timeout for hours. Validated by accident when the Postgres container was recreated mid-run and the job simply carried on. |
+| Windows shifted onto local hour boundaries | Spark aligns event-time windows to midnight UTC, so in +05:30 an "hourly" window runs `23:30–00:30`. Every reported boundary would be half an hour off the clock, and the alert rules — written in local hours — would test 09:30–16:30. |
+| Alert rules are **pure functions** over one row | `processing/shared/alert_rules.py` imports neither Spark nor psycopg, so the logic that decides whether an operator is woken up is unit-tested in `tests/test_alert_rules.py` without Kafka, a JVM or a database. |
+| The low-renewable rule checks **09:00–16:00**, not all daylight | A 06:00–07:00 window genuinely sits near 0% renewable because the sun has just risen. Checking the full 06:00–18:00 span fires the rule at dawn and dusk every simulated day, which is a calendar, not an alert. |
+| The overload ceiling is **2.2 kW/meter**, per meter rather than per zone | Per-meter because zones differ in size (12 meters against 9), so one absolute kW figure is unreachable for the small zones. The value is calibrated against the simulator's own demand curve: 1.25 kW base × 1.50 evening peak × ~10% residual jitter ≈ 2.06, which is exactly the highest window measured across five simulated days. The first draft used 1.6, derived from base load alone, and fired for the two largest zones every simulated evening — caught by running it, and now pinned by a test. |
+| A new run supersedes the previous `RUNNING` row | `docker compose stop` signals PID 1, which for a PySpark job is `spark-submit`'s JVM; the JVM kills the Python driver rather than forwarding the signal, so a container stop can never close its own row. Since a new run proves the old one has ended, `register_run` marks it `FAILED` with a note and logs how many it superseded. |
+| 503 and 500 are kept apart in the API | An unreachable database is 503: the dependency is down and restarting the API would achieve nothing. A query Postgres refuses is 500: the API's own code is wrong. Collapsing them is how a malformed cast gets diagnosed as a dead database — which happened here, once. |
+
+---
+
 ## What Phase 0 stood up
 
 | Service | Host endpoint | Purpose |
@@ -510,23 +868,32 @@ Three deliberate choices worth knowing:
 ├─ infra/postgres/init/        # serving schema, applied on first boot
 ├─ infra/seaweedfs/s3.json     # S3 identity, so credentials are enforced
 ├─ infra/spark/Dockerfile      # Spark + pinned Kafka/S3A/committer jars
+├─ infra/api/Dockerfile        # the API's own slim image
 ├─ common/                     # config, JSON logging, simulated clock, S3 client
 ├─ docs/                       # ADR, diagrams, tech-stack justification
 ├─ scripts/
 │  ├─ stack_status.py          # Phase 0 checkpoint verifier
 │  ├─ check_phase1.py          # Phase 1 checkpoint verifier
-│  └─ check_phase2.py          # Phase 2 checkpoint verifier
-├─ tests/                      # 70 tests, no Docker or JVM required
+│  ├─ check_phase2.py          # Phase 2 checkpoint verifier
+│  └─ check_phase3.py          # Phase 3 checkpoint verifier
+├─ tests/                      # 90 tests, no Docker or JVM required
 ├─ sources/
 │  ├─ meter_model.py           # meter population + reading physics (pure, tested)
 │  ├─ stream_producer.py       # meter events -> Kafka
 │  └─ tariff_generator.py      # daily tariff CSV -> object storage
 ├─ processing/
-│  ├─ shared/                  # schema + transforms imported by BOTH layers
+│  ├─ shared/
+│  │  ├─ schemas.py            # event contract + sim_day, used by both layers
+│  │  ├─ transforms.py         # the energy aggregation, called by both layers
+│  │  ├─ alert_rules.py        # threshold rules as pure, testable functions
+│  │  └─ pg.py                 # idempotent writes into the serving layer
 │  ├─ raw_sink.py              # Phase 2: Kafka -> partitioned Parquet
-│  └─ inspect_raw.py           # Phase 2: read the store back with Spark
+│  ├─ inspect_raw.py           # Phase 2: read the store back with Spark
+│  └─ speed_layer.py           # Phase 3: windowed zone metrics + alerts
 ├─ orchestration/dags/         # Phase 4: Airflow billing DAG
-├─ serving/api/                # Phase 3: FastAPI app
+├─ serving/api/
+│  ├─ main.py                  # Phase 3: FastAPI endpoints
+│  └─ db.py                    # read-side queries (reads only, never writes)
 ├─ observability/              # Phase 6: prometheus + grafana config
 └─ reports/                    # generated billing report samples
 ```
@@ -553,3 +920,11 @@ Three deliberate choices worth knowing:
 | `No module named 'common.config'` inside Spark | `spark-submit` puts the submitted script's directory first on `sys.path`. That is why the shared package is `processing/shared/` and not `processing/common/`, which would shadow the top-level `common/`. |
 | Phase 2 coverage stuck below 90% | The sink has stalled. Check its logs, then restart it; the checkpoint means it resumes where it left off. |
 | Master store has rows but `check_phase2` can't read it | pyarrow discovery skips `_`-prefixed paths. If a stray non-Parquet file was written under the prefix, remove it. |
+| `password authentication failed for user "grid"` from the host | A PostgreSQL installed on your machine already owns 5432 and Docker binds alongside it, so you reached the wrong server. Set `POSTGRES_EXTERNAL_PORT=5433` in `.env` and `docker compose up -d postgres`. |
+| `/zones` returns `"zones": []` with a note | No window has closed yet. The first one closes ~12 real seconds after the speed layer starts, and only if the producer is running. |
+| API returns 503 | The serving database is unreachable — check `docker compose ps postgres` and the port note above. The API itself is fine; restarting it will not help. |
+| API returns 500 | A query the API sends is wrong, not the database. The reason is in `docker compose logs api` as a `query_failed` line with the SQL error. |
+| `speed-layer` exits with a `StreamingQueryException` about the query plan | The window size or watermark changed, which Structured Streaming cannot resume across. Clear the checkpoint — see *Restarting cleanly* above. |
+| Alerts repeat for the same window | Only possible after a restart: the dedupe guard is in memory. A repeat is visible as a second `run_id` on the alert row. |
+| `pipeline_runs` shows old rows as `RUNNING` | They were killed rather than stopped. The next run of the same component marks them `FAILED` with a note saying so. |
+| No alerts ever fire | Expected in normal operation. The renewable rule only applies 09:00–16:00 simulated; force it with `--cloud-cover 0.95`. The overload ceiling sits above the simulated evening peak by design. |

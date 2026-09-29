@@ -27,13 +27,39 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - only on the Spark image's Python 3.8
+    # `zoneinfo` arrived in 3.9 and the apache/spark:3.5.3 image ships 3.8. The
+    # backport is API-identical, and it is installed explicitly in
+    # infra/spark/Dockerfile rather than left to arrive as psycopg's dependency.
+    from backports.zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ANCHOR_FILE = PROJECT_ROOT / "data" / ".sim_anchor"
 ANCHOR_ENV_VAR = "SG_REAL_ANCHOR"
 
 SECONDS_PER_DAY = 86400.0
+
+
+def window_alignment_minutes(timezone: str, window_minutes: int) -> int:
+    """How far to shift the windows so they land on local clock boundaries.
+
+    Spark aligns event-time windows to the Unix epoch, which is midnight UTC. In
+    a zone offset by a whole number of hours that is invisible, but Asia/Colombo
+    is +05:30, so hourly windows come out running 23:30-00:30 rather than
+    00:00-01:00. Two things suffer: every window_start in the report and on the
+    dashboard is half an hour off the hour, and the alert rules -- which are
+    written in local hours, "check renewable between 09:00 and 16:00" -- end up
+    testing 09:30 to 16:30 instead.
+
+    Shifting the grid by the remainder of the zone's offset fixes both. Sri Lanka
+    has no daylight saving, so the offset is constant and one number is enough.
+    """
+    offset = datetime.now(ZoneInfo(timezone)).utcoffset()
+    if offset is None:
+        return 0
+    return int((offset.total_seconds() // 60) % window_minutes)
 
 
 def resolve_real_anchor(anchor_file: Path = ANCHOR_FILE) -> float:

@@ -49,6 +49,28 @@ def test_host_and_container_endpoints_differ(cfg: Config, monkeypatch) -> None:
     assert cfg.kafka_bootstrap.startswith("kafka:")
 
 
+def test_postgres_dsn_splits_host_from_container(cfg: Config, monkeypatch) -> None:
+    # The same mistake as the Kafka listeners, and it bit once: `.env` defines
+    # POSTGRES_HOST=postgres for the containers, so a host-side script that read
+    # the same variable got a name that does not resolve outside Docker.
+    monkeypatch.delenv("SG_IN_DOCKER", raising=False)
+    monkeypatch.setenv("POSTGRES_EXTERNAL_HOST", "localhost")
+    monkeypatch.setenv("POSTGRES_EXTERNAL_PORT", "5433")
+    assert "@localhost:5433/" in cfg.postgres_dsn
+
+    monkeypatch.setenv("SG_IN_DOCKER", "1")
+    monkeypatch.setenv("POSTGRES_HOST", "postgres")
+    assert "@postgres:5432/" in cfg.postgres_dsn
+
+
+def test_postgres_dsn_pins_the_simulation_time_zone(cfg: Config) -> None:
+    # Without this the same stored window prints as a different hour in the API
+    # container (UTC) than on the host, and only one of them is the simulated one.
+    # libpq percent-decodes the query string, so the space must not become a "+".
+    zone = cfg.simulation["timezone"]
+    assert f"options=-c%20timezone%3D{zone.replace('/', '%2F')}" in cfg.postgres_dsn
+
+
 def test_bucket_names_resolve(cfg: Config) -> None:
     # Only two buckets: the Parquet master store is a mounted volume, not S3.
     assert cfg.bucket("tariff") and cfg.bucket("reports")

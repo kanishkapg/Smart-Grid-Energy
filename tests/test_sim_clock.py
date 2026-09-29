@@ -11,7 +11,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from common.sim_clock import ANCHOR_ENV_VAR, SimClock, resolve_real_anchor
+from common.sim_clock import (
+    ANCHOR_ENV_VAR,
+    SimClock,
+    resolve_real_anchor,
+    window_alignment_minutes,
+)
 
 ANCHOR = 1_700_000_000.0          # an arbitrary but fixed real instant
 EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -106,3 +111,34 @@ def test_env_var_overrides_the_anchor_file(tmp_path, monkeypatch) -> None:
 
     # This is how a container inherits the host's clock.
     assert resolve_real_anchor(anchor_path) == 9999.0
+
+
+# ---------------------------------------------------------------------------
+# window alignment (Phase 3)
+# ---------------------------------------------------------------------------
+
+def test_window_alignment_shifts_half_hour_zones() -> None:
+    # Spark aligns event-time windows to midnight UTC. Asia/Colombo is +05:30,
+    # so without a shift an "hourly" window runs 23:30-00:30 local, and an alert
+    # rule written as "09:00 to 16:00" silently tests 09:30 to 16:30.
+    assert window_alignment_minutes("Asia/Colombo", 60) == 30
+
+
+def test_whole_hour_zones_need_no_shift() -> None:
+    assert window_alignment_minutes("UTC", 60) == 0
+    assert window_alignment_minutes("Europe/Berlin", 60) == 0
+
+
+def test_alignment_is_relative_to_the_window_length() -> None:
+    # A 30-minute window already divides the +05:30 offset exactly, so the grid
+    # is aligned and shifting it would move every boundary off the clock.
+    assert window_alignment_minutes("Asia/Colombo", 30) == 0
+    assert window_alignment_minutes("Asia/Colombo", 15) == 0
+
+
+def test_alignment_is_always_inside_one_window() -> None:
+    # A shift of a whole window or more would be indistinguishable from no shift
+    # at all, so the remainder is the only meaningful value.
+    for minutes in (15, 30, 60, 120, 1440):
+        offset = window_alignment_minutes("Asia/Colombo", minutes)
+        assert 0 <= offset < minutes

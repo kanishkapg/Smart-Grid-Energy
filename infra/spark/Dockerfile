@@ -51,6 +51,18 @@ RUN set -eu; cd /opt/spark/jars; \
 RUN cd /opt/spark/jars && \
     curl -fsSLO "$MAVEN/org/apache/spark/spark-hadoop-cloud_$SCALA_VERSION/$SPARK_VERSION/spark-hadoop-cloud_$SCALA_VERSION-$SPARK_VERSION.jar"
 
+# Phase 3: both Spark layers write to the serving database through psycopg
+# rather than through Spark's JDBC writer, because every write has to be an
+# idempotent upsert and JDBC cannot express one -- reasoning in
+# processing/shared/pg.py. The binary wheel bundles libpq, so no apt packages are
+# needed.
+#
+# Deliberately below the jars: a layer added above them would invalidate the
+# cache and re-download ~250 MB on every rebuild.
+RUN pip3 install --no-cache-dir \
+      "psycopg[binary]==3.2.3" \
+      "backports.zoneinfo==0.2.1"
+
 # Structured Streaming checkpoints live on a docker volume, not in object
 # storage: checkpointing needs atomic rename, which S3 only emulates by copying.
 # Creating the directory here with the spark user's ownership is what lets the

@@ -6,7 +6,11 @@
 #    seaweedfs  -> S3-compatible object store (raw master store + tariff drop)
 #    postgres   -> serving layer              (zone_metrics, daily_bill, alerts)
 #
-#  Later phases add: spark, airflow, fastapi, grafana, prometheus.
+#  Phase 2 adds  raw-sink     -> Kafka -> partitioned Parquet master store
+#  Phase 3 adds  speed-layer  -> windowed zone metrics + alerts -> Postgres
+#                api          -> FastAPI real-time metrics endpoints
+#
+#  Later phases add: airflow, grafana, prometheus.
 # ===========================================================================
 
 name: ${COMPOSE_PROJECT_NAME:-smartgrid}
@@ -171,7 +175,12 @@ services:
     hostname: postgres
     logging: *default-logging
     ports:
-      - "5432:5432"
+      # Host-side port is configurable because a locally installed PostgreSQL
+      # commonly already owns 5432. Docker still binds successfully in that case
+      # on Windows, so the symptom is not "port in use" -- it is host tools
+      # silently authenticating against the wrong server. Inside the compose
+      # network the port is always 5432.
+      - "${POSTGRES_EXTERNAL_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
       POSTGRES_USER: ${POSTGRES_USER:-grid}
@@ -239,6 +248,101 @@ services:
       --master local[2]
       --driver-memory 1g
       /app/processing/raw_sink.py
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Phase 3 -- the speed layer.
+  #
+  # Spark Structured Streaming over Kafka: event-time tumbling windows per grid
+  # zone, upserted into `zone_metrics`, with threshold rules appending to
+  # `alerts`. Runs in update mode, so the window in progress is visible and is
+  # corrected in place as late events arrive.
+  #
+  # A second Spark container rather than a second query inside raw-sink: the two
+  # jobs have different failure modes and different restart semantics. The raw
+  # sink is the master dataset and must not be interrupted by a bug in an alert
+  # rule, and each query keeps its own checkpoint so either can be replayed
+  # alone.
+  # -------------------------------------------------------------------------
+  speed-layer:
+    build:
+      context: ./infra/spark
+    image: smartgrid/spark:3.5.3
+    container_name: sg-speed-layer
+    logging: *default-logging
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      SG_IN_DOCKER: "1"
+      PYTHONPATH: /app
+      KAFKA_INTERNAL_BOOTSTRAP: ${KAFKA_INTERNAL_BOOTSTRAP:-kafka:9092}
+      KAFKA_TOPIC_READINGS: ${KAFKA_TOPIC_READINGS:-meter.readings}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+    volumes:
+      - ./common:/app/common:ro
+      - ./processing:/app/processing:ro
+      - ./config:/app/config:ro
+      - spark-checkpoints:/checkpoints
+    working_dir: /app
+    ports:
+      - "4041:4040"      # Spark UI; 4040 is already taken by raw-sink
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --driver-memory 1g
+      /app/processing/speed_layer.py
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Phase 3 -- the real-time API.
+  #
+  # Reads only. All aggregation belongs to the layer that owns the stream; an API
+  # that recomputed it would be a second implementation free to disagree.
+  # -------------------------------------------------------------------------
+  api:
+    build:
+      context: ./infra/api
+    image: smartgrid/api:0.3.0
+    container_name: sg-api
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SG_IN_DOCKER: "1"
+      PYTHONPATH: /app
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+    volumes:
+      - ./common:/app/common:ro
+      - ./config:/app/config:ro
+      - ./serving:/app/serving:ro
+    working_dir: /app
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: >
+      uvicorn serving.api.main:app
+      --host 0.0.0.0 --port 8000
+      --log-level ${API_LOG_LEVEL:-info}
+    healthcheck:
+      # /health returns 200 whenever the database is reachable, so this probes
+      # the API and its dependency without going red every time the producer is
+      # stopped -- which is a normal state during a demo, not a broken API.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
 volumes:

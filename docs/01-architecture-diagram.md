@@ -17,7 +17,7 @@ flowchart LR
   end
 
   subgraph BATCH["BATCH LAYER — daily, exact, re-runnable"]
-    K -->|"raw sink"| RAW[("S3 / Parquet<br/>raw/meter_readings/<br/>sim_day=../grid_zone=..<br/>IMMUTABLE MASTER DATASET")]
+    K -->|"raw sink"| RAW[("Mounted volume / Parquet<br/>data/raw/meter_readings/<br/>sim_day=../grid_zone=..<br/>IMMUTABLE MASTER DATASET")]
     AF["Airflow DAG<br/>FileSensor on tariff file"] --> BJ
     RAW --> BJ["Spark batch<br/>consumption ⨝ tariff<br/>net metering + subsidy"]
     M --> BJ
@@ -49,12 +49,17 @@ reconciliation) → serve (API + Grafana) → observe (Prometheus/Grafana + JSON
 
 ```mermaid
 flowchart TB
-  CM["processing/common/<br/>schemas.py · aggregations.py · billing.py<br/><b>ONE implementation of the business rules</b>"]
+  CM["processing/shared/<br/>schemas.py · spark_session.py · aggregations.py · billing.py<br/><b>ONE implementation of the business rules</b>"]
+  CM --> RS["raw_sink.py<br/>trigger: micro-batch every 15s<br/>source: Kafka<br/>sink: Parquet (append)"]
   CM --> SP["speed/zone_metrics_job.py<br/>trigger: micro-batch every 5s<br/>source: Kafka<br/>sink: zone_metrics (upsert)"]
   CM --> BT["batch/billing_job.py<br/>trigger: Airflow, per sim-day<br/>source: Parquet + tariff CSV<br/>sink: daily_bill (upsert)"]
   classDef shared fill:#f3f0ff,stroke:#7048e8,stroke-width:2px
   class CM shared
 ```
+
+> Named `shared`, not `common`: `spark-submit` puts the submitted script's own
+> directory first on `sys.path`, so a `processing/common/` package would shadow
+> the project's top-level `common/` and every job would fail to import its config.
 
 This is the concrete answer to Lambda's standard criticism. The duplicated part
 is only the **trigger and the sink** — which *should* differ between a

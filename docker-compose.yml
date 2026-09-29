@@ -92,9 +92,11 @@ services:
 
   # -------------------------------------------------------------------------
   # SeaweedFS: S3-compatible object storage.
-  #   raw/     -> immutable Parquet master dataset (Phase 2)
   #   tariff/  -> the once-per-simulated-day tariff CSV drop (Phase 1)
   #   reports/ -> generated daily billing reports (Phase 4)
+  #
+  # The Parquet master store is NOT here: it lives on a mounted volume, because
+  # Spark cannot commit a write to SeaweedFS. See docs/02-tech-stack.md.
   #
   # Why not MinIO: MinIO withdrew its public container images, so `minio/minio`
   # and `quay.io/minio/minio` can no longer be pulled without a licence. The
@@ -142,7 +144,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-smartgridsecret}
       AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://seaweedfs:8333}
-      BUCKETS: ${S3_BUCKET_RAW:-raw} ${S3_BUCKET_TARIFF:-tariff} ${S3_BUCKET_REPORTS:-reports}
+      BUCKETS: ${S3_BUCKET_TARIFF:-tariff} ${S3_BUCKET_REPORTS:-reports}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -184,6 +186,62 @@ services:
       retries: 10
       start_period: 10s
 
+  # -------------------------------------------------------------------------
+  # Phase 2 -- the raw master store.
+  #
+  # A Spark Structured Streaming job reading Kafka and appending Parquet to
+  # object storage, partitioned by sim_day/grid_zone. This is the dataset the
+  # batch layer recomputes billing from, which is what makes the batch layer
+  # authoritative rather than just another consumer.
+  #
+  # Runs in local[2] mode: a single container acting as its own driver and
+  # executor. A real cluster would separate them, but the marks here are for the
+  # architecture, not for operating a Spark cluster on a laptop.
+  # -------------------------------------------------------------------------
+  raw-sink:
+    build:
+      context: ./infra/spark
+    image: smartgrid/spark:3.5.3
+    container_name: sg-raw-sink
+    logging: *default-logging
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      # Selects the in-network endpoints (kafka:9092, http://seaweedfs:8333)
+      # over the host-facing ones.
+      SG_IN_DOCKER: "1"
+      PYTHONPATH: /app
+      KAFKA_INTERNAL_BOOTSTRAP: ${KAFKA_INTERNAL_BOOTSTRAP:-kafka:9092}
+      KAFKA_TOPIC_READINGS: ${KAFKA_TOPIC_READINGS:-meter.readings}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://seaweedfs:8333}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-smartgrid}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-smartgridsecret}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET_TARIFF: ${S3_BUCKET_TARIFF:-tariff}
+    volumes:
+      # Read-only source mounts: edit a job on the host and restart the service.
+      - ./common:/app/common:ro
+      - ./processing:/app/processing:ro
+      - ./config:/app/config:ro
+      # The Parquet master store. A bind mount rather than a named volume so the
+      # partition directories are directly browsable on the host, which also
+      # lets the verification script read them without Docker.
+      - ./data/raw:/data/raw
+      - spark-checkpoints:/checkpoints
+    working_dir: /app
+    ports:
+      - "4040:4040"      # Spark UI: streaming query progress, stages, storage
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --driver-memory 1g
+      /app/processing/raw_sink.py
+    restart: unless-stopped
+
 volumes:
   seaweed-data:
   postgres-data:
+  spark-checkpoints:

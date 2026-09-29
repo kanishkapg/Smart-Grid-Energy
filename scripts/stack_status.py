@@ -23,7 +23,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_TABLES = ["alerts", "daily_bill", "pipeline_runs", "zone_metrics"]
-EXPECTED_BUCKETS = ["raw", "reports", "tariff"]
+# No "raw" bucket: the Parquet master store is a mounted volume, not object
+# storage (see docs/02-tech-stack.md).
+EXPECTED_BUCKETS = ["reports", "tariff"]
 INIT_SERVICES = ("kafka-init", "storage-init")
 
 

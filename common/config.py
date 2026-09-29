@@ -150,10 +150,24 @@ class Config:
         return os.environ.get("S3_REGION", "us-east-1")
 
     def bucket(self, kind: str) -> str:
-        """kind is one of: raw, tariff, reports."""
+        """kind is one of: tariff, reports."""
         return os.environ.get(
             f"S3_BUCKET_{kind.upper()}", self.storage[f"bucket_{kind}"]
         )
+
+    @property
+    def raw_store_path(self) -> str:
+        """Filesystem path of the Parquet master store.
+
+        A mounted volume, not object storage -- see the note in config.yaml. The
+        container and the host see the same directory at different paths, so the
+        right one is chosen the same way the service endpoints are.
+        """
+        root = (
+            self.storage["raw_root_container"] if self.in_docker
+            else self.storage["raw_root_host"]
+        )
+        return f"{root}/{self.storage['raw_prefix']}"
 
     @property
     def postgres_dsn(self) -> str:

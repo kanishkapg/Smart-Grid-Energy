@@ -8,7 +8,8 @@ doing a job UC3 actually requires. Nothing is included to look impressive.
 | Streaming source | **Python** producer | Emits meter readings every 2 real seconds, keyed by `household_id` | Brief mandates simulated Python sources. `kafka-python` over `confluent-kafka` because it is pure Python — no C toolchain needed on the Windows dev machines this is built on. |
 | Batch source | **Python** generator | Writes one tariff CSV per simulated day into `tariff/` | Brief mandates a once-per-day file drop. Keeping it a file is the whole basis of ADR-001. |
 | Ingestion | **Apache Kafka, KRaft mode** | Buffered, partitioned, replayable event intake | Required by the brief. Decouples producer cadence from Spark's processing rate, so a slow consumer applies back-pressure instead of dropping data. KRaft removes the Zookeeper container — one less moving part to explain and to keep healthy. |
-| Master store | **SeaweedFS (S3 API) + Parquet** | Append-only raw events, partitioned `sim_day / grid_zone` | Lambda's batch layer is defined by recomputing from immutable raw data, so this is load-bearing, not storage for its own sake. Parquet because the batch job reads whole columns over a day partition — columnar, with predicate pushdown on the partition keys. SeaweedFS because it serves the S3 API locally, so the code is identical against real S3. See the note below on why not MinIO. |
+| Master store | **Mounted volume + Parquet** | Append-only raw events, partitioned `sim_day / grid_zone` | Lambda's batch layer is defined by recomputing from immutable raw data, so this is load-bearing, not storage for its own sake. Parquet because the batch job reads whole columns over a day partition — columnar, with partition pruning on the directory keys. A volume rather than S3 because Spark cannot commit a write to SeaweedFS; see the section below, which documents three separate attempts. |
+| Tariff + report storage | **SeaweedFS (S3 API)** | The daily tariff CSV drop and the generated billing reports | Keeps a genuine S3 API in the architecture, and Spark reads the tariff over `s3a://`. See below on why not MinIO. |
 | Stream processing | **Spark Structured Streaming** | Event-time tumbling windows, zone aggregation, alert rules | Required. Crucially it gives **event-time** windowing with watermarks: readings arrive out of order under a compressed clock, and processing-time windows would smear them across the wrong buckets. |
 | Batch processing | **Spark (batch)** | Daily `consumption ⨝ tariff` → billing | Reusing Spark is what makes the shared `processing/common/` library possible — the same aggregation function runs in both layers rather than being written twice in two dialects. |
 | Orchestration | **Apache Airflow** | Schedules, sensors, retries and monitors the billing DAG | Required. Gives the batch layer real orchestration: a `FileSensor` on the tariff file (robust against clock drift, unlike a bare cron), retries, and a run history that makes the idempotent upsert design meaningful. |
@@ -63,5 +64,54 @@ satisfied, and the trade-off is documented in the report rather than hidden:
 |---|---|
 | `apache/kafka:3.9.0` | Official image with first-class KRaft support via `KAFKA_*` env vars. |
 | `postgres:16-alpine` | Small image; 16 is current-stable and Grafana-compatible. |
-| Spark ↔ Kafka ↔ Postgres jars | Pinned together in the Spark image (Phase 2): mismatched `spark-sql-kafka` / Scala / JDBC versions are the single most common failure in this kind of stack. |
+| `apache/spark:3.5.3` | Official image. Bitnami's Spark images went commercial, like MinIO's. Ships Scala 2.12, hadoop-client 3.3.4 and Java 11, all of which constrain the jars below. |
+| Spark connector jars | Pinned as build args in `infra/spark/Dockerfile`. The plan names jar mismatches as a top pitfall, so the compatibility chain is written down rather than discovered: `spark-sql-kafka-0-10_2.12:3.5.3` + `kafka-clients:3.4.1` + `commons-pool2` (absent from the base image), and `hadoop-aws:3.3.4` which **must** match the bundled hadoop-client, plus the AWS SDK v1 bundle it was built against. Baked in, not fetched by `--packages`, so the stack runs offline and starts fast. |
 | `kafka-python` (pure Python) | Avoids needing a C compiler for `librdkafka` on Windows. |
+
+## Why the master store is a mounted volume, not object storage
+
+The plan specifies S3 + Parquet for the raw store, and that was built first. It
+does not work against SeaweedFS. **Spark can read from it perfectly well; it
+cannot commit a write to it.** Three separate attempts, each defeated by a
+different defect, all in the commit path:
+
+| Attempt | Failure | Why |
+|---|---|---|
+| 1. Spark's built-in Parquet **file sink** | `ParentNotDirectoryException: parent is not a dir: …/_spark_metadata/…` | The file sink keeps a commit log at `<path>/_spark_metadata` for exactly-once file visibility. S3A cannot create it, because SeaweedFS's gateway does not present the directory marker as a directory. `fs.s3a.directory.marker.retention=keep` does not help. |
+| 2. `foreachBatch` + ordinary partitioned write | `IOException: Failed to rename …/_temporary/… to …` | The default committer stages output under `_temporary/` and renames it into place. Object stores have no rename; S3A emulates it by copying every object, and that emulation fails outright on these partitioned paths. |
+| 3. Same, with the S3A **magic committer** | `NullPointerException` in `SimpleDateFormat.format` ← `AbstractS3ACommitter.warnOnActiveUploads` | The magic committer avoids rename entirely by completing multipart uploads — and it genuinely worked, until a batch left pending uploads behind. On `setupJob` it lists them and formats each upload's `Initiated` timestamp; SeaweedFS **omits that field**, so Hadoop formats `null` and every subsequent batch dies. Confirmed by `aws s3api list-multipart-uploads`, whose entries carry only `Key` and `UploadId`. |
+
+Attempt 3 is the instructive one: it fails only *after* an interrupted batch, so
+it looks like it works and then wedges the job into a crash loop that nothing but
+manual multipart cleanup will clear. That is not a property to ship.
+
+**Decision:** the master store moved to a mounted volume (`./data/raw`), which is
+the fallback the project plan explicitly offers. The architecture is unchanged —
+still append-only Parquet, still partitioned `sim_day/grid_zone`, still the
+dataset the batch layer recomputes billing from. Only the access protocol
+changed, and a local filesystem has real atomic rename, so Spark's default
+committer works with no configuration at all.
+
+Object storage keeps the jobs it *can* do: the daily tariff drop and the
+generated reports. Spark still reads the tariff CSV over `s3a://`, so the S3 code
+path is exercised — reads use no commit protocol, which is exactly why they work.
+
+**A side benefit:** the partition directories are now browsable in Explorer,
+which demos better than an object-store UI, and `scripts/check_phase2.py` reads
+them with no credentials and no network.
+
+### The at-least-once consequence
+
+Dropping the file sink means dropping its commit log, so delivery is
+**at-least-once**: if a batch's files land and the driver dies before its Kafka
+offsets are committed, the retry writes those rows again.
+
+This is handled rather than ignored. `dedupe_readings()` in
+`processing/shared/schemas.py` collapses duplicates on the natural key
+`(meter_id, timestamp)`, and every reader of the master store goes through it —
+including the Phase 4 billing job, where it matters directly for money, since a
+replayed batch would otherwise double-count and overcharge those households.
+
+Writing at-least-once and deduplicating on read is a standard data-lake pattern,
+not a workaround: the store keeps everything it ever received, and readers agree
+on one interpretation of it.

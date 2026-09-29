@@ -68,7 +68,7 @@ events.
 | **0** | Infra: Kafka (KRaft), MinIO, Postgres + serving schema | `scripts/stack_status.py` prints a green checkpoint | ✅ |
 | **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 65 passing | ✅ |
 | **1** | Simulated sources: meter stream → Kafka, tariff CSV → object storage | `scripts/check_phase1.py` prints a green checkpoint | ✅ |
-| 2 | Raw master store: streaming sink → partitioned Parquet | Parquet row count ≈ events produced | ⏳ |
+| **2** | Raw master store: Spark Structured Streaming → partitioned Parquet | `scripts/check_phase2.py` reconciles Parquet against Kafka | ✅ |
 | 3 | Speed layer + FastAPI real-time API | `/zones` returns live figures; forced low solar fires an alert | ⏳ |
 | 4 | Batch billing + Airflow DAG | green DAG run; hand-calculated bill matches `daily_bill` | ⏳ |
 | 5 | Grafana dashboards | two rendering dashboards | ⏳ |
@@ -288,6 +288,186 @@ accumulating, one per simulated day.
 
 ---
 
+## Verifying Phase 2, step by step
+
+Phase 2 adds **Spark**. A Structured Streaming job reads `meter.readings` and
+appends Parquet to `./data/raw/meter_readings/`, partitioned by
+`sim_day/grid_zone`. This is the immutable master dataset the batch layer
+recomputes billing from — without it, the batch layer has no claim to be
+authoritative.
+
+> **The master store is a mounted volume, not S3.** The plan specifies S3, and
+> that was built first — but Spark cannot commit a write to SeaweedFS. Three
+> separate attempts each failed on a different defect, all in the commit path.
+> The volume is the fallback the plan explicitly offers, and nothing about the
+> architecture changes: still append-only Parquet, still partitioned by
+> `sim_day/grid_zone`. Object storage keeps the tariff drop and the reports, and
+> Spark still *reads* the tariff over `s3a://`. Full reasoning, including the
+> exact errors, is in [docs/02-tech-stack.md](docs/02-tech-stack.md).
+
+It runs as a compose service, so `docker compose up -d` starts it with
+everything else. The first run builds the Spark image (~1 GB, several minutes)
+because the connector jars are baked in.
+
+### Step 1 — bring the stack up, including the sink
+
+```powershell
+docker compose up -d
+docker compose ps
+```
+
+**Expect** four running services (`kafka`, `postgres`, `seaweedfs`, `raw-sink`)
+and the two `-init` jobs `exited (0)`.
+
+### Step 2 — start the producer, so there is something to store
+
+```powershell
+python -m sources.stream_producer --log-format console
+```
+
+The sink needs a stream. Leave this running in its own terminal.
+
+### Step 3 — watch the sink commit micro-batches
+
+```powershell
+docker compose logs -f raw-sink
+```
+
+**Expect** a `starting_query` line, then one `batch_written` line per trigger
+(every 15 s):
+
+```json
+{"component": "raw_sink", "source_topic": "meter.readings",
+ "output_path": "/data/raw/meter_readings", "checkpoint_path": "/checkpoints/raw_sink",
+ "partition_by": ["sim_day", "grid_zone"], "trigger_seconds": 15, "event": "starting_query"}
+{"component": "raw_sink", "batch_id": 0, "event": "batch_written"}
+{"component": "raw_sink", "batch_id": 1, "event": "batch_written"}
+```
+
+Spark's own `INFO` lines are suppressed to `WARN` so these stay readable.
+The Spark UI is at **http://localhost:4040** — the *Structured Streaming* tab
+shows input rate, batch duration and offsets per micro-batch.
+
+### Step 4 — reconcile Parquet against Kafka
+
+```powershell
+python scripts\check_phase2.py
+```
+
+This is the plan's checkpoint — "row count in Parquet ≈ events produced" — made
+precise by comparing two independent sources of truth.
+
+```
+  Raw master store   data/raw/meter_readings
+      + Kafka holds       2,480 events
+      + Parquet stores    2,200 rows in 38 file(s)
+      + distinct readings 2,200  (meter_id + timestamp)
+      + coverage 88.7%; lag 280 events (~14s of production at 20/s)
+        budget is 900 events = 3 x the 15s trigger interval
+      + all 6 data columns present in the files
+      + partition columns encoded in the path: ['sim_day', 'grid_zone']
+
+      sim_day       grid_zone           rows
+      2025-12-31    Colombo-North          1
+      2026-01-01    Colombo-North        659
+      2026-01-01    Colombo-South        549
+      ...
+      PHASE 2 CHECKPOINT: PASSED
+```
+
+**Reading the output.** Coverage under 100% is normal and is *not* judged as a
+percentage. The sink commits every 15 s, so it always trails Kafka by about one
+interval's worth of events; on a small topic that is a big percentage and on a
+large one it is a small one. The check instead compares the **absolute lag**
+against a budget derived from config — 40 meters ÷ 2 s = 20 events/s × 15 s
+trigger × 3 intervals = 900 events. Exceeding that means the sink has stalled.
+
+The per-partition row counts are the strongest evidence the clock and the
+partitioning are both right: a complete simulated day holds
+**meters × 150 readings**, so Colombo-North's 12 meters give exactly 1800 rows.
+Partial days at either end of a run are expected.
+
+Uses pyarrow reading local files — no JVM, no credentials, no network.
+
+### Step 5 — query the store with Spark
+
+```powershell
+docker compose run --rm --no-deps raw-sink `
+  /opt/spark/bin/spark-submit /app/processing/inspect_raw.py
+```
+
+This is the checkpoint's second half — `spark.read.parquet(...)` and query a
+partition — and a rehearsal for Phase 4, which reads the same data the same way.
+
+**Expect** the schema, a dedup count, a partition table, and a per-zone
+aggregate for one simulated day:
+
+```
+rows as stored:     2,520
+rows after dedup:   2,520   (natural key: meter_id + timestamp)
+duplicate rows:     0
+
+=== one partition queried: sim_day = 2026-01-01 ===
+|grid_zone    |consumption_kwh|solar_kwh|active_meters|renewable_pct|
+|Colombo-North|93.392         |16.768   |12           |18.0         |
+|Colombo-South|87.532         |11.155   |10           |12.7         |
+|Gampaha      |60.446         |7.457    |9            |12.3         |
+|Kandy        |53.965         |5.653    |9            |10.5         |
+```
+
+Add `--sim-day 2026-01-02` to query a specific day. `renewable_pct` depends on
+how much of the simulated day the partition covers — a partial day ending mid
+morning is lower than a full day's 14–24%.
+
+### Seeing the files yourself
+
+The store is a plain directory, so just look:
+
+```powershell
+Get-ChildItem data\raw\meter_readings -Recurse -Filter *.parquet | Select-Object -First 5 FullName
+Get-ChildItem data\raw\meter_readings -Directory
+```
+
+Or open `data\raw\meter_readings` in Explorer and click down through
+`sim_day=…\grid_zone=…\`. A `_temporary` directory appearing mid-write is
+normal; the verification script skips `_`-prefixed paths.
+
+### Restarting cleanly
+
+The checkpoint holds the Kafka offsets already consumed, so a restart resumes
+rather than re-reading the topic. To replay from the beginning you must clear
+**both** the data and the checkpoint, or you will get a partial reprocess:
+
+```powershell
+docker compose rm -sf raw-sink
+docker volume rm smartgrid_spark-checkpoints
+Remove-Item data\raw\meter_readings -Recurse -Force
+docker compose up -d raw-sink
+```
+
+### What Phase 2 decides, and why
+
+| Decision | Reason |
+|---|---|
+| Connector jars **baked into the image**, versions pinned as build args | `--packages` re-resolves from Maven on every start. The plan names jar mismatches as a top pitfall; `infra/spark/Dockerfile` documents the compatibility chain (Spark 3.5.3 → Scala 2.12, hadoop-aws **must** be 3.3.4 to match the bundled hadoop-client, kafka-clients 3.4.1). |
+| Master store on a **mounted volume**, not S3 | Spark could not commit a write to SeaweedFS by any of three routes — the file sink's `_spark_metadata` log, rename-based commit, and the magic committer. A local filesystem has real atomic rename, so the default committer just works. Errors and reasoning in [docs/02-tech-stack.md](docs/02-tech-stack.md). |
+| `foreachBatch` instead of `.format("parquet")` | Kept from the S3 attempt, and still the right choice: it gives one explicit, readable write per micro-batch, and `repartition` before writing controls the file count. |
+| Delivery is **at-least-once**, deduplicated on read | The cost of not using the file sink's commit log. If a batch's files land and the driver dies before offsets commit, the retry rewrites those rows. `dedupe_readings()` collapses them on the natural key `(meter_id, timestamp)`, and every reader goes through it — which matters directly for money, since a replayed batch would otherwise double-bill. |
+| `repartition` by the partition columns before writing | Without it each of the topic's 3 partitions writes its own file per zone, so one batch produces ~12 files instead of ~4. Every extra small file is another object to open on a read. |
+| Checkpoints on a **docker volume**, separate from the data | Checkpointing needs atomic rename and read-after-write consistency, and keeping offsets separate from data means the store can be wiped and replayed independently. |
+| `sim_day` first in the partition path | The billing job filters by day, so Spark prunes whole days instead of opening every zone's files. |
+| Session time zone pinned to `Asia/Colombo` | `to_date` resolves the event timestamp's `+05:30` offset in this zone. Left at UTC, a reading at 00:02 Colombo time would be filed under the *previous* simulated day and both days' bills would be wrong. |
+| 15 s trigger | One file per partition per micro-batch. The raw store has a completeness requirement, not a latency one, so a slower trigger buys larger files. |
+| `local[2]`, 1 GB driver | A single container as its own driver and executor. The marks are for the architecture, not for running a Spark cluster on a laptop. |
+
+> **A partition you should expect to see:** a handful of rows filed one
+> simulated day *earlier* than the rest. Those are the deliberately backdated
+> late events crossing midnight — a reading backdated 20 simulated minutes from
+> 00:05 genuinely belongs to the previous day. It is correct, and it is why
+> Phase 4 should bill a day only after the watermark has passed.
+
+---
+
 ## What Phase 0 stood up
 
 | Service | Host endpoint | Purpose |
@@ -297,8 +477,9 @@ accumulating, one per simulated day.
 | SeaweedFS filer UI | `localhost:8888` | browse buckets and objects in a browser |
 | PostgreSQL | `localhost:5432` | serving layer (`smartgrid` / `grid` / `gridpass`) |
 
-Buckets: `raw` (immutable Parquet master dataset), `tariff` (daily CSV drop),
-`reports` (generated billing reports).
+Buckets: `tariff` (daily CSV drop), `reports` (generated billing reports). There
+is no `raw` bucket — the Parquet master store is the `./data/raw` volume, for the
+reasons in [docs/02-tech-stack.md](docs/02-tech-stack.md).
 Tables: `zone_metrics`, `daily_bill`, `alerts`, `pipeline_runs`.
 
 Three deliberate choices worth knowing:
@@ -328,17 +509,22 @@ Three deliberate choices worth knowing:
 ├─ config/config.yaml          # single source of truth for every tunable
 ├─ infra/postgres/init/        # serving schema, applied on first boot
 ├─ infra/seaweedfs/s3.json     # S3 identity, so credentials are enforced
+├─ infra/spark/Dockerfile      # Spark + pinned Kafka/S3A/committer jars
 ├─ common/                     # config, JSON logging, simulated clock, S3 client
 ├─ docs/                       # ADR, diagrams, tech-stack justification
 ├─ scripts/
 │  ├─ stack_status.py          # Phase 0 checkpoint verifier
-│  └─ check_phase1.py          # Phase 1 checkpoint verifier
-├─ tests/                      # 65 tests, no Docker required
+│  ├─ check_phase1.py          # Phase 1 checkpoint verifier
+│  └─ check_phase2.py          # Phase 2 checkpoint verifier
+├─ tests/                      # 70 tests, no Docker or JVM required
 ├─ sources/
 │  ├─ meter_model.py           # meter population + reading physics (pure, tested)
 │  ├─ stream_producer.py       # meter events -> Kafka
 │  └─ tariff_generator.py      # daily tariff CSV -> object storage
-├─ processing/                 # Phase 2-4: common/ speed/ batch/
+├─ processing/
+│  ├─ shared/                  # schema + transforms imported by BOTH layers
+│  ├─ raw_sink.py              # Phase 2: Kafka -> partitioned Parquet
+│  └─ inspect_raw.py           # Phase 2: read the store back with Spark
 ├─ orchestration/dags/         # Phase 4: Airflow billing DAG
 ├─ serving/api/                # Phase 3: FastAPI app
 ├─ observability/              # Phase 6: prometheus + grafana config
@@ -363,3 +549,7 @@ Three deliberate choices worth knowing:
 | `check_phase1.py` says "no events arrived" | The producer isn't running. Start `python -m sources.stream_producer` in another terminal first. |
 | `ModuleNotFoundError: No module named 'common'` | Run from the project root with the environment activated. Scripts in `scripts/` add the root to `sys.path` themselves; `python -m sources.x` needs the root as your working directory. |
 | All zones show 0% renewable | Check the simulated hour in the header line. Overnight that is correct — `check_phase1.py` states whether it is day or night. |
+| `raw-sink` restart-looping | Read the traceback: `docker compose logs --tail 40 raw-sink`. Jobs are mounted read-only from the host, so a syntax error needs only `docker compose restart raw-sink`. |
+| `No module named 'common.config'` inside Spark | `spark-submit` puts the submitted script's directory first on `sys.path`. That is why the shared package is `processing/shared/` and not `processing/common/`, which would shadow the top-level `common/`. |
+| Phase 2 coverage stuck below 90% | The sink has stalled. Check its logs, then restart it; the checkpoint means it resumes where it left off. |
+| Master store has rows but `check_phase2` can't read it | pyarrow discovery skips `_`-prefixed paths. If a stray non-Parquet file was written under the prefix, remove it. |

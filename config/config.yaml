@@ -89,12 +89,26 @@ kafka:
 # Object storage layout (S3-compatible; SeaweedFS locally)
 # ---------------------------------------------------------------------------
 storage:
-  bucket_raw: "raw"
+  # --- object storage: the daily tariff drop and the generated reports -------
   bucket_tariff: "tariff"
   bucket_reports: "reports"
-  raw_prefix: "meter_readings"     # raw/meter_readings/sim_day=.../grid_zone=...
-  raw_partition_cols: ["sim_day", "grid_zone"]
   tariff_filename_pattern: "tariff_{sim_day}.csv"   # sim_day as YYYYMMDD
+
+  # --- the immutable Parquet master store -----------------------------------
+  # A mounted volume rather than object storage. This is the fallback the
+  # project plan offers, and it was forced by three separate defects in the way
+  # Spark's S3A connector interacts with SeaweedFS -- all on the *write* path,
+  # all documented in docs/02-tech-stack.md. Spark still reads the tariff CSV
+  # over S3, so the S3 code path is exercised; only the commit protocol was the
+  # problem, and only writes use it.
+  #
+  # Nothing about the architecture changes: the master dataset is still
+  # append-only Parquet partitioned by sim_day/grid_zone, and it is still what
+  # the batch layer recomputes billing from.
+  raw_root_container: "/data/raw"   # mounted into the Spark containers
+  raw_root_host: "data/raw"         # the same directory seen from the host
+  raw_prefix: "meter_readings"      # <root>/meter_readings/sim_day=.../grid_zone=...
+  raw_partition_cols: ["sim_day", "grid_zone"]
 
 # ---------------------------------------------------------------------------
 # Speed layer (Spark Structured Streaming) -- values in SIMULATED time
@@ -103,7 +117,23 @@ speed_layer:
   window_minutes: 60               # 1 simulated hour  (~12.5 real seconds)
   watermark_minutes: 30            # tolerate ~3 readings' worth of lateness
   trigger_seconds: 5               # real-time micro-batch cadence
-  checkpoint_dir: "s3a://raw/_checkpoints/speed_layer"
+
+# ---------------------------------------------------------------------------
+# Spark
+# ---------------------------------------------------------------------------
+spark:
+  # Structured Streaming checkpoints go to a docker volume, NOT to object
+  # storage. A checkpoint needs atomic rename and read-after-write consistency;
+  # S3 only emulates rename by copying, which makes checkpoint commits slow and,
+  # on an interrupted write, corruptible. The data goes to S3; the offsets stay
+  # on a real filesystem.
+  checkpoint_root: "/checkpoints"
+
+  # Real seconds between micro-batches in the raw sink. One Parquet file is
+  # written per partition per batch, so a tighter trigger buys lower latency at
+  # the cost of many small files -- and the raw store has no latency requirement,
+  # only a completeness one.
+  raw_sink_trigger_seconds: 15
 
 # ---------------------------------------------------------------------------
 # Alert thresholds

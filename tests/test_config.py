@@ -50,7 +50,8 @@ def test_host_and_container_endpoints_differ(cfg: Config, monkeypatch) -> None:
 
 
 def test_bucket_names_resolve(cfg: Config) -> None:
-    assert cfg.bucket("raw") and cfg.bucket("tariff") and cfg.bucket("reports")
+    # Only two buckets: the Parquet master store is a mounted volume, not S3.
+    assert cfg.bucket("tariff") and cfg.bucket("reports")
 
 
 # --- validation: each rule rejects the mistake it was written for ----------

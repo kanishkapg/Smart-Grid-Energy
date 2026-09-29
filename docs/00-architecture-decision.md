@@ -35,9 +35,12 @@ both branches.
 | **Batch layer** | Spark batch, orchestrated by Airflow | Recompute the day's billing from the **immutable raw Parquet store** joined to that day's tariff file; exact and idempotent |
 | **Serving layer** | PostgreSQL → FastAPI + Grafana | One queryable surface for both branches |
 
-The master dataset is append-only Parquet in S3-compatible object storage, partitioned by
-`sim_day / grid_zone`. Kafka is treated as a *transport buffer*, not the system
-of record — which is why it is not persisted to a volume in `docker-compose.yml`.
+The master dataset is append-only Parquet partitioned by `sim_day / grid_zone`,
+held on a mounted volume rather than in object storage (Spark cannot commit a
+write to the available S3 implementation — see `docs/02-tech-stack.md`; the
+architecture is unaffected, only the access protocol). Kafka is treated as a
+*transport buffer*, not the system of record — which is why it is not persisted
+to a volume in `docker-compose.yml`.
 
 ## 3. Why this fits UC3 specifically
 

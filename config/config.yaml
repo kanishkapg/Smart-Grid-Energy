@@ -93,6 +93,10 @@ storage:
   bucket_tariff: "tariff"
   bucket_reports: "reports"
   tariff_filename_pattern: "tariff_{sim_day}.csv"   # sim_day as YYYYMMDD
+  # One report per billed simulated day. Overwritten on a re-run, deliberately:
+  # the report is a view of daily_bill, and two files for one day would leave it
+  # ambiguous which one the billing department should send.
+  report_filename_pattern: "billing_{sim_day}.csv"
 
   # --- the immutable Parquet master store -----------------------------------
   # A mounted volume rather than object storage. This is the fallback the

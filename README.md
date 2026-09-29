@@ -66,23 +66,24 @@ events.
 | Phase | Delivers | Visible outcome | State |
 |---|---|---|---|
 | **0** | Infra: Kafka (KRaft), MinIO, Postgres + serving schema | `scripts/stack_status.py` prints a green checkpoint | ✅ |
-| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 90 passing | ✅ |
+| **0+** | Shared foundation: config, JSON logging, simulated clock | `python -m pytest` → 106 passing | ✅ |
 | **1** | Simulated sources: meter stream → Kafka, tariff CSV → object storage | `scripts/check_phase1.py` prints a green checkpoint | ✅ |
 | **2** | Raw master store: Spark Structured Streaming → partitioned Parquet | `scripts/check_phase2.py` reconciles Parquet against Kafka | ✅ |
 | **3** | Speed layer (windowed zone metrics + alerts) + FastAPI real-time API | `scripts/check_phase3.py` prints a green checkpoint; `--cloud-cover` fires an alert | ✅ |
-| 4 | Batch billing + Airflow DAG | green DAG run; hand-calculated bill matches `daily_bill` | ⏳ |
+| **4** | Batch billing (Spark) + Airflow DAG | `scripts/check_phase4.py` re-derives a bill from Parquet and matches `daily_bill` | ✅ |
 | 5 | Grafana dashboards | two rendering dashboards | ⏳ |
 | 6 | Observability hardening | kill the producer → "no data" alert fires | ⏳ |
 | 7 | Report, README, demo | clean-clone reproduce | ⏳ |
 
 ---
 
-## Verifying everything, phase 0 → 3
+## Verifying everything, phase 0 → 4
 
-Each phase has its **own** checkpoint script, and running the Phase 3 one does not
+Each phase has its **own** checkpoint script, and running a later one does not
 verify the earlier phases — the speed layer reads Kafka directly, so it can be
-perfectly healthy while the Parquet master store is empty or stalled. To check the
-platform end to end, run all four in order.
+perfectly healthy while the Parquet master store is empty or stalled, and the
+batch layer reads that same store, so *it* can be broken while the speed layer
+looks fine. To check the platform end to end, run all five in order.
 
 ### Terminals
 
@@ -95,6 +96,9 @@ scripts are one-shot and can share one.
 | 2 | `python -m sources.tariff_generator --log-format console` | leave running throughout |
 | 3 | the checkpoint scripts below, one after another | returns each time |
 | 4 *(optional)* | `docker compose logs -f speed-layer` | blocks until Ctrl+C |
+
+The batch layer needs no terminal of its own: Airflow runs it inside the stack,
+on a schedule. Its UI is at **http://localhost:8080** (`admin` / `admin`).
 
 Every terminal needs the environment activated (`conda activate bigdata`) and the
 project root as its working directory.
@@ -112,11 +116,12 @@ python -m sources.stream_producer --log-format console
 python -m sources.tariff_generator --log-format console
 
 # --- terminal 3, in this order -------------------------------------------
-python -m pytest                    # 90 passing        (no Docker needed)
+python -m pytest                    # 106 passing       (no Docker needed)
 python scripts\stack_status.py      # PHASE 0 CHECKPOINT: PASSED
 python scripts\check_phase1.py      # PHASE 1 CHECKPOINT: PASSED
 python scripts\check_phase2.py      # PHASE 2 CHECKPOINT: PASSED
 python scripts\check_phase3.py      # PHASE 3 CHECKPOINT: PASSED
+python scripts\check_phase4.py      # PHASE 4 CHECKPOINT: PASSED
 ```
 
 ### What each one proves, and how long to wait first
@@ -128,10 +133,16 @@ python scripts\check_phase3.py      # PHASE 3 CHECKPOINT: PASSED
 | `check_phase1.py` | Events on the topic match the event contract; a tariff CSV exists with 40 household rows. | ~20 s of producer, and one tariff file written |
 | `check_phase2.py` | Parquet row count reconciles against Kafka's offsets; partition layout is `sim_day/grid_zone`; duplicates are accounted for. | ~30 s (the raw sink commits every 15 s) |
 | `check_phase3.py` | Every zone is reporting fresh windows; window arithmetic is right; the API agrees with Postgres. | ~15 s (the first window closes after ~12.5 s) |
+| `check_phase4.py` | A simulated day has been billed; one household's bill, recomputed from Parquet on the host, matches `daily_bill` to the cent. | one **closed** simulated day — 5 real minutes of producer, plus a DAG run |
 
-Run them in order: a Phase 2 failure explains a Phase 3 failure, but not the other
-way round, and `check_phase3.py` will happily report a healthy speed layer while
-the master dataset the batch layer depends on is broken.
+Run them in order: a Phase 2 failure explains a Phase 3 *and* a Phase 4 failure,
+but not the other way round, and `check_phase3.py` will happily report a healthy
+speed layer while the master dataset the batch layer depends on is broken.
+
+Phase 4 is the one that needs patience rather than seconds: nothing can be billed
+until a simulated day has *closed*, which is five real minutes after the producer
+starts. Until then `check_phase4.py` reports an empty `daily_bill` and tells you
+how to bill a past day instead — see the Phase 4 walkthrough below.
 
 ### The alert demo, separately
 
@@ -826,6 +837,426 @@ master dataset is untouched.
 
 ---
 
+## Verifying Phase 4, step by step
+
+Phase 4 adds the **batch layer** and the **scheduler**. A Spark batch job
+recomputes one simulated day's household bills from the Parquet master store,
+joins that day's tariff file, and upserts the result into `daily_bill`; an Airflow
+DAG runs it once per simulated day and checks the result before calling the run
+green.
+
+> **Exactness, not latency.** This is the half of Lambda that is allowed to be
+> slow and has to be right. It reads nothing from the speed layer and trusts
+> nothing the speed layer wrote: the input is the immutable Parquet store, the
+> meter count is exact, and every figure is reproducible by re-running the job.
+> What the two layers share is their arithmetic —
+> `processing/shared/transforms.py` and `processing/shared/billing.py` — and
+> nothing else, which is what makes agreement between them evidence rather than
+> tautology.
+
+### Step 1 — build and start everything
+
+The stack gains three things: `airflow`, a one-shot `airflow-db-init` that creates
+Airflow's metadata database inside the existing Postgres, and `billing-batch`,
+which is a job rather than a service and so does not start with the others.
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+The first build downloads a JRE and PySpark into the Airflow image — roughly 1 GB,
+several minutes. Afterwards:
+
+```
+SERVICE       STATUS
+airflow       Up 6 minutes (healthy)
+api           Up About an hour (healthy)
+kafka         Up 3 minutes (healthy)
+postgres      Up 3 minutes (healthy)
+raw-sink      Up 3 minutes
+seaweedfs     Up 3 minutes
+speed-layer   Up 45 seconds
+```
+
+`docker compose ps -a` additionally shows `airflow-db-init  Exited (0)`, which is
+correct — it creates the `airflow` database if it is not there and gets out of the
+way. It is a separate container rather than a script in `infra/postgres/init/`
+because those only run when the Postgres volume is *created*, and by Phase 4 your
+stack already has one.
+
+Airflow takes two to three minutes to become healthy on a first start: it runs its
+migrations, creates the admin user and boots three components. The UI is at
+**http://localhost:8080**, username `admin`, password `admin` (both set in `.env`).
+
+### Step 2 — choose a simulated day that has finished
+
+The batch layer bills **closed** days only. Billing a day still being written
+produces a total that is simply too low — with no error, and with a primary key
+that then blocks the correct figure from being inserted later. So the job refuses:
+
+```powershell
+docker compose run --rm billing-batch --sim-day 20260321   # today, in simulated time
+```
+
+```
+refusing to bill 2026-03-21: the simulated day is still in progress (it is now
+2026-03-21 04:34:56+05:30 simulated). Bill the previous day, or pass --allow-open-day.
+```
+
+To see which days the master store actually holds:
+
+```powershell
+dir data\raw\meter_readings
+```
+
+A complete simulated day holds `40 meters × 150 readings = 6,000` rows. Days the
+producer only partly covered are still billable — they bill what was measured — but
+the checkpoint script will say so rather than let it pass unnoticed.
+
+Every billed day also needs its tariff file. The generator reproduces any past day
+exactly, because the rate is seeded by (household, day) rather than rolled:
+
+```powershell
+python -m sources.tariff_generator --sim-day 20260121
+```
+
+```
+[info] tariff_file_written  bucket=tariff key=tariff_20260121.csv households=40
+                            sim_day=2026-01-21 subsidised=12
+```
+
+Run it twice and the file is byte-identical. That property is what makes the batch
+layer's claim to be re-runnable real rather than nominal.
+
+### Step 3 — run the batch job by hand
+
+Before involving a scheduler, run the job itself. `billing-batch` is a compose
+service under the `manual` profile, so it never starts with `up`, and its entry
+point is `spark-submit` — anything after the service name is an argument to the job:
+
+```powershell
+docker compose run --rm billing-batch --sim-day 20260121 --log-format console
+```
+
+```
+[info] starting          component=billing_batch compression_factor=288.0 total_meters=40
+[info] billing_day       sim_day=2026-01-21 currency=LKR net_metering=import_only
+                         subsidy_pct=0.1
+[info] tariff_loaded     source=s3://tariff/tariff_20260121.csv
+[info] day_read          sim_day=2026-01-21 readings=6000 expected_readings=6000
+                         completeness_pct=100.0
+[info] report_published  bucket=reports key=billing_20260121.csv rows=40
+[info] billing_complete  sim_day=2026-01-21 rows_written=40 households=40
+                         total_consumption_kwh=817.1813 total_solar_kwh=151.1249
+                         net_kwh=666.0564 gross_amount=28896.67 subsidy_amount=833.21
+                         net_amount=28063.46 subsidised_households=12 currency=LKR
+                         report=s3://reports/billing_20260121.csv
+```
+
+Four lines carry the whole argument:
+
+| Log line | What it settles |
+|---|---|
+| `tariff_loaded` | The day's commercial terms came from the file drop, not from a default |
+| `day_read` | 6,000 readings after deduplication against 6,000 expected — a complete day |
+| `billing_complete` | 40 households billed; 817 kWh drawn, 151 kWh generated, 666 kWh billable |
+| `report_published` | The artefact a billing department would be sent is in object storage |
+
+If the tariff file is missing, the job stops **before** building a Spark session —
+input validation is cheaper than JVM startup, so this fails in about a second
+rather than after twenty — and tells you the one command that fixes it:
+
+```
+[error] billing_failed  sim_day=2026-01-19
+        error=no tariff file for 2026-01-19 at s3://tariff/tariff_20260119.csv
+        (NoSuchKey). The generator can reproduce any past day exactly:
+            python -m sources.tariff_generator --sim-day 20260119
+```
+
+The run is still recorded in `pipeline_runs` as `FAILED`, so a day that was never
+billed is visible as an attempt rather than as silence.
+
+### Step 4 — look at what it wrote
+
+**The serving table.** One row per household per simulated day:
+
+```powershell
+docker compose exec postgres psql -U grid -d smartgrid -c "SELECT household_id, grid_zone, billing_tier, net_kwh, tariff_rate, subsidy_flag, net_amount FROM daily_bill WHERE sim_day = '2026-01-21' ORDER BY household_id LIMIT 5;"
+```
+
+**The published report.** One CSV per billed day in the `reports` bucket, named
+`billing_<YYYYMMDD>.csv` and overwritten on a re-run — the report is a view of
+`daily_bill`, and two files for one day would leave it ambiguous which one is the
+bill.
+
+```powershell
+python -c "from common.config import load_config; from common.storage import s3_client, list_keys; cfg = load_config(); print(list_keys(s3_client(cfg), cfg.bucket('reports')))"
+```
+
+**The API.** Phase 4 adds two read-only endpoints, so the batch layer's output is
+visible over HTTP alongside the speed layer's — which is what makes Postgres a
+Lambda *serving* layer rather than two unrelated tables:
+
+```powershell
+curl http://localhost:8000/bills
+curl http://localhost:8000/bills/2026-01-21
+```
+
+`/bills` lists the days that have been billed and what each came to; `/bills/{sim_day}`
+returns that day's forty bills with the day's totals. An unbilled day is a 404, and a
+malformed date is a 400 rather than a 500.
+
+### Step 5 — the same job, on a schedule
+
+One simulated day is five real minutes, so the DAG is scheduled `*/5 * * * *` — the
+compressed equivalent of a nightly billing run. Its four tasks are:
+
+```
+resolve_sim_day  ->  wait_for_tariff  ->  bill_day  ->  verify_bills
+```
+
+- **resolve_sim_day** asks the shared simulated clock which day has just closed and
+  pushes it to XCom, so every later task works on the same day. Airflow's own
+  logical date is real time and would name a date the simulation never reaches.
+- **wait_for_tariff** is a sensor over object storage. Keeping "the input arrived"
+  separate from "compute the money" means a missing tariff shows up as a task still
+  waiting, not as a Spark job that crashed.
+- **bill_day** is the `spark-submit` from Step 3.
+- **verify_bills** re-reads `daily_bill` and re-derives every amount from the stored
+  usage and rate. A green Spark task can still have written a wrong day.
+
+**The DAG ships paused.** Unpausing it starts a Spark JVM every five real minutes
+for as long as the stack is up, which on an 8 GB laptop is enough to get the
+Airflow webserver OOM-killed mid-billing. So billing is started deliberately —
+from the toggle in the UI, or:
+
+```powershell
+docker compose exec airflow airflow dags unpause daily_billing
+```
+
+Watch it in the UI, or from the command line:
+
+```powershell
+docker compose exec airflow airflow dags list-runs -d daily_billing --no-backfill
+docker compose exec airflow airflow tasks states-for-dag-run daily_billing "<run_id>"
+```
+
+A scheduled run, billing the simulated day that had just closed:
+
+```
+task_id          state    start_date                        end_date
+resolve_sim_day  success  2026-09-29T06:21:21.497124+00:00  2026-09-29T06:21:22.425273+00:00
+wait_for_tariff  success  2026-09-29T06:21:44.496853+00:00  2026-09-29T06:22:06.717064+00:00
+bill_day         success  2026-09-29T08:14:52.590736+00:00  2026-09-29T08:17:49.729934+00:00
+verify_bills     success  2026-09-29T08:17:57.358389+00:00  2026-09-29T08:17:58.951796+00:00
+```
+
+To bill one specific past day instead — which is what a real backfill does, and what
+the checkpoint below uses:
+
+```powershell
+docker compose exec airflow airflow dags trigger daily_billing --conf '{\"sim_day\": \"20260120\"}'
+```
+
+```
+task_id          state    start_date                        end_date
+resolve_sim_day  success  2026-09-29T06:01:01.682620+00:00  2026-09-29T06:01:06.709047+00:00
+wait_for_tariff  success  2026-09-29T06:01:09.681580+00:00  2026-09-29T06:01:47.789581+00:00
+bill_day         success  2026-09-29T06:01:54.149497+00:00  2026-09-29T06:09:55.732591+00:00
+verify_bills     success  2026-09-29T06:10:06.118439+00:00  2026-09-29T06:10:07.983750+00:00
+```
+
+Two things to know before unpausing:
+
+- **A manual trigger only runs once the DAG is unpaused.** Airflow's scheduler
+  skips paused DAGs entirely, including runs you triggered by hand — they sit in
+  `queued` until you unpause.
+- **Scheduled runs need the producer and the tariff generator running.** Without
+  them no simulated day is being filled, so `wait_for_tariff` polls for three real
+  minutes and then fails — the sensor doing its job, not a broken DAG. Start both
+  (terminals 1 and 2 above) and the next scheduled run goes green on its own.
+
+`max_active_runs=1`, so a manual trigger waits while a scheduled run is still
+polling. That is why the sensor's timeout is three minutes rather than ten: a run
+that cannot find its input has to fail before the next one is scheduled.
+
+When you are done demonstrating it, pause it again — `airflow dags pause
+daily_billing` — and the machine goes back to running only the two streaming jobs.
+
+### Step 6 — run the checkpoint
+
+```powershell
+python scripts\check_phase4.py
+python scripts\check_phase4.py --sim-day 20260121 --household H-105
+```
+
+The script re-reads the household's readings **from the Parquet files with pyarrow**,
+sums them in plain Python, applies the same billing rules, and compares the result
+column by column against what Spark stored. The two paths share the rules and nothing
+else, so agreement means the numbers are right rather than that one implementation ran
+twice.
+
+```
+  Smart Grid Lambda Platform -- Phase 4 batch billing check
+  ----------------------------------------------------------
+
+  Serving DB   localhost:5433/smartgrid
+  Master store data/raw/meter_readings
+  Billed day   2026-01-21   (2026-01-21 to 2026-01-22, simulated)
+
+  Batch run            [PASS]
+      + newest run billing_batch-20260929T054713-0f05e8 finished SUCCESS
+        wrote 40 row(s) in 66.9s
+      + every row for the day carries one run_id
+      + daily_bill.run_id matches the newest run, so the rows trace back to its logs
+
+  Bill coverage        [PASS]
+
+      grid_zone         bills      net kWh subsidised   payable LKR
+      Colombo-North        12      195.857          3       9028.46
+      Colombo-South        10      202.006          3       7685.69
+      Gampaha               9      139.330          3       5630.41
+      Kandy                 9      128.864          3       5718.90
+
+      + 40 of 40 configured households billed
+      + every configured zone appears
+      + no bill is negative or charges more units than were used
+
+  Hand calculation     [PASS]
+
+      H-105 on 2026-01-21 -- recomputed from 150 reading(s) in the master store:
+
+                                            recomputed        stored
+      + consumption                   kWh       21.6811       21.6811
+      + solar generation              kWh        7.0044        7.0044
+      + net = max(used - solar, 0)    kWh       14.6767       14.6767
+      + gross = net x 46.25           LKR         678.8         678.8
+      + subsidy @  10%                 LKR         67.88         67.88
+      + payable                       LKR        610.92        610.92
+
+      + tier domestic-2 on the 2026-01-21 tariff file, subsidised
+
+  Published report     [PASS]
+      + s3://reports/billing_20260121.csv published
+      + 40 data row(s), matching daily_bill's 40
+        first row: 2026-01-21,H-101,Colombo-North,21.4214,6.8579,14.5635,domestic-1,30.85,False,449.28,0.0,449.28
+
+  Serving API          [PASS]
+      + /bills lists 1 billed day(s)
+      + /bills/2026-01-21 serves 40 bills totalling 28063.46 LKR, agreeing with Postgres
+      + an unbilled day: 404 as expected
+
+  Lambda cross-check   [INFO]
+
+      grid_zone            batch kWh     speed kWh   windows  difference
+      Colombo-North           257.67        255.89        24        0.7%
+      Colombo-South           243.29        241.65        24        0.7%
+      Gampaha                 166.82        165.66        24        0.7%
+      Kandy                   149.39        148.34        24        0.7%
+
+      The batch figure is the authoritative one. The speed layer
+      only covers the windows it was running for, so a difference
+      here is coverage, not disagreement about arithmetic.
+
+  ----------------------------------------------------------
+  PHASE 4 CHECKPOINT: PASSED
+```
+
+The last block is the one worth pausing on. Both layers measured the same simulated
+day: the batch layer read 6,000 Parquet rows, the speed layer summed the 24 windows
+it had published live, and they land within 0.7% of each other. The deficit is the
+speed layer's, and it is coverage rather than arithmetic — a window left partial when
+the streaming job restarted stays partial, because nothing goes back to correct it.
+That is precisely the trade the architecture decision argues for, measured rather than
+asserted.
+
+### Step 7 — prove it is re-runnable
+
+Trigger the same day again. The job recomputes from immutable Parquet and upserts on
+`(sim_day, household_id)`, so the second run rewrites the same forty rows:
+
+```powershell
+docker compose exec airflow airflow dags trigger daily_billing --conf '{\"sim_day\": \"20260120\"}'
+python scripts\check_phase4.py --sim-day 20260120
+```
+
+```
+  Batch run            [PASS]
+      + newest run sg-billing-20260929T060002-1 finished SUCCESS
+        wrote 40 row(s) in 326.8s
+      + billed 2 times in total; the upsert kept one row per household
+      + every row for the day carries one run_id
+      + daily_bill.run_id matches the newest run, so the rows trace back to its logs
+```
+
+Two runs, forty rows, one `run_id` — and that id is `sg-billing-<timestamp>-<try>`,
+minted by Airflow and adopted by the job through `SG_RUN_ID`. A suspicious bill
+therefore names the DAG run that produced it, which joins to `pipeline_runs` and to
+that task's JSON logs.
+
+### Memory: the one real constraint on a laptop
+
+The batch job starts a JVM inside the Airflow container while two streaming Spark
+drivers are already running. On an 8 GB machine Docker Desktop takes 3.7 GB by
+default, and that is not quite enough for all of it at once. The failure is not
+subtle, but it is easy to misread — it appears in the `bill_day` task log as:
+
+```
+OSError: [Errno 12] Cannot allocate memory: '/app/processing'
+```
+
+The same shortage shows up on the Airflow side as a dead UI while the scheduler
+keeps working — `Worker (pid:…) was sent SIGKILL! Perhaps out of memory?` followed
+by `No response from gunicorn master`.
+
+That is a capacity failure, not a bug. Three things hold it in check: the DAG ships
+paused, so a Spark JVM starts only when you ask for one; both streaming jobs run
+with `--driver-memory 512m` (measured working set ~450 MB); and the billing job runs
+with 512m and the Spark UI disabled. If you still hit it:
+
+- give Docker Desktop more memory (Settings → Resources) if the host has it to spare;
+- or stop the producer while a billing run is in flight — the raw sink resumes from its
+  checkpoint afterwards and loses nothing;
+- or run the job with `docker compose run --rm billing-batch`, which is the same work
+  without Airflow's scheduler and webserver resident alongside it.
+
+With nothing else competing the job takes about a minute; under a full stack with the
+producer running, it took five and a half.
+
+### Re-billing from scratch
+
+```powershell
+docker compose exec postgres psql -U grid -d smartgrid -c "DELETE FROM daily_bill WHERE sim_day = '2026-01-21';"
+docker compose run --rm billing-batch --sim-day 20260121
+```
+
+Nothing else needs clearing: the batch layer holds no checkpoint and no state. Its
+inputs are a directory of Parquet files and a CSV, both immutable, so "delete the
+output and run it again" is a complete reset. That is the property the speed layer
+cannot offer, and the reason the batch layer is the authoritative one.
+
+### What Phase 4 decides, and why
+
+| Decision | Reason |
+|---|---|
+| The batch layer reads **Parquet, never Kafka or `zone_metrics`** | This is what "authoritative" means. Recomputing from the immutable master store means a bug fixed today can be replayed over history; recomputing from the speed layer's output would only reproduce its approximations, and Kafka's 24-hour retention cannot answer for last week at all. |
+| Deduplicate on `(meter_id, timestamp)` before billing | The raw sink is at-least-once, so a replayed micro-batch is physically in the files. Without the dedupe those households are billed twice — the one defect in this phase that would look like a perfectly plausible number. |
+| **Exact** meter counts here, approximate in the speed layer | Spark rejects an exact `count(distinct)` in a streaming aggregation; a batch job has no such limit. Same shared function, one flag — so the accuracy split the architecture decision argues for shows up in the code rather than only in prose. |
+| Billing rules are **pure Python**, not Spark expressions | Money must be verifiable by hand. `processing/shared/billing.py` imports nothing, so the plan's worked example (H-101: 18 kWh used, 6 generated, rate 45, subsidised → 486) is a unit test, and `scripts/check_phase4.py` can recompute a real bill on the host with no JVM. Spark still does the big-data work: scan, dedupe, aggregate, join. |
+| Round the money **once**, then subtract | `net_amount = gross - subsidy` exactly, because both were rounded before the subtraction. Rounding each column independently lets the three disagree by a cent, and a bill whose parts do not add up is indefensible however small the gap. |
+| Upsert on `(sim_day, household_id)` | What makes a retry safe. Airflow retries `bill_day` twice by default; without the upsert the second attempt would either double-bill or hit the primary key and fail. |
+| Refuse to bill an **open** simulated day | A partial day bills too little, silently, and then owns the primary key. `--allow-open-day` exists for a demo and says what it is doing. |
+| **Left** join to the tariff, then fail on unpriced households | An inner join would quietly drop a household with no tariff row. Billing part of a zone produces a plausible, wrong total — so the job writes nothing and names the households. |
+| The tariff is read with **boto3**, not Spark over S3A | Forty rows. Reading it through S3A would mean shipping a 250 MB AWS SDK into the Airflow image to fetch a 2 KB file. Spark's contribution to that join is the join. |
+| Spark runs **inside** the Airflow image, not via `DockerOperator` | The textbook arrangement needs the Docker socket mounted, the container running as root to use it, and the DAG naming *host* paths for every mount — three environment-specific dependencies for a job that runs in local mode either way. A real deployment submits to a cluster instead, which is one operator swap, not a redesign. |
+| Airflow's metadata lives in a **second database in the same Postgres** | One less container on a machine already running seven. The isolation that matters — Airflow's tables never mixing with the serving tables — is what a separate database gives; a separate server would only add operational surface. SQLite was the alternative, and it forces the SequentialExecutor. |
+| The simulated day comes from the **simulated clock**, not Airflow's logical date | The logical date is real time. The simulation is somewhere in January 2026 regardless of today's date, so scheduling on the logical date would bill a day that does not exist. |
+| `verify_bills` is a task, not a comment | A data-quality gate that fails the run: every household billed, every amount re-derived from its own stored usage and rate, and one run owning the whole day. The last check catches a day half-written by one run and half by another. |
+| `SG_RUN_ID` is set by the DAG and adopted by the job | One correlation id spans the Airflow run, the `pipeline_runs` row, every `daily_bill` row and the job's JSON logs — so a suspicious bill leads back to the exact execution that wrote it. |
+
+---
+
 ## What Phase 0 stood up
 
 | Service | Host endpoint | Purpose |
@@ -869,14 +1300,16 @@ Three deliberate choices worth knowing:
 ├─ infra/seaweedfs/s3.json     # S3 identity, so credentials are enforced
 ├─ infra/spark/Dockerfile      # Spark + pinned Kafka/S3A/committer jars
 ├─ infra/api/Dockerfile        # the API's own slim image
+├─ infra/airflow/Dockerfile    # Airflow + a JRE + PySpark, for the billing DAG
 ├─ common/                     # config, JSON logging, simulated clock, S3 client
 ├─ docs/                       # ADR, diagrams, tech-stack justification
 ├─ scripts/
 │  ├─ stack_status.py          # Phase 0 checkpoint verifier
 │  ├─ check_phase1.py          # Phase 1 checkpoint verifier
 │  ├─ check_phase2.py          # Phase 2 checkpoint verifier
-│  └─ check_phase3.py          # Phase 3 checkpoint verifier
-├─ tests/                      # 90 tests, no Docker or JVM required
+│  ├─ check_phase3.py          # Phase 3 checkpoint verifier
+│  └─ check_phase4.py          # Phase 4 checkpoint verifier
+├─ tests/                      # 106 tests, no Docker or JVM required
 ├─ sources/
 │  ├─ meter_model.py           # meter population + reading physics (pure, tested)
 │  ├─ stream_producer.py       # meter events -> Kafka
@@ -887,12 +1320,15 @@ Three deliberate choices worth knowing:
 │  │  ├─ transforms.py         # the energy aggregation, called by both layers
 │  │  ├─ alert_rules.py        # threshold rules as pure, testable functions
 │  │  └─ pg.py                 # idempotent writes into the serving layer
+│  │  └─ billing.py            # net metering, subsidy, tariff parsing (pure)
 │  ├─ raw_sink.py              # Phase 2: Kafka -> partitioned Parquet
 │  ├─ inspect_raw.py           # Phase 2: read the store back with Spark
-│  └─ speed_layer.py           # Phase 3: windowed zone metrics + alerts
-├─ orchestration/dags/         # Phase 4: Airflow billing DAG
+│  ├─ speed_layer.py           # Phase 3: windowed zone metrics + alerts
+│  └─ billing_batch.py         # Phase 4: Parquet + tariff -> daily_bill
+├─ orchestration/dags/
+│  └─ daily_billing_dag.py     # Phase 4: the scheduled batch run
 ├─ serving/api/
-│  ├─ main.py                  # Phase 3: FastAPI endpoints
+│  ├─ main.py                  # Phase 3-4: FastAPI endpoints
 │  └─ db.py                    # read-side queries (reads only, never writes)
 ├─ observability/              # Phase 6: prometheus + grafana config
 └─ reports/                    # generated billing report samples
@@ -928,3 +1364,15 @@ Three deliberate choices worth knowing:
 | Alerts repeat for the same window | Only possible after a restart: the dedupe guard is in memory. A repeat is visible as a second `run_id` on the alert row. |
 | `pipeline_runs` shows old rows as `RUNNING` | They were killed rather than stopped. The next run of the same component marks them `FAILED` with a note saying so. |
 | No alerts ever fire | Expected in normal operation. The renewable rule only applies 09:00–16:00 simulated; force it with `--cloud-cover 0.95`. The overload ceiling sits above the simulated evening peak by design. |
+| `bill_day` fails with `Cannot allocate memory` | The Docker VM ran out while a Spark JVM was starting inside Airflow. Not a bug — see *Memory: the one real constraint on a laptop* above. Stop the producer, or raise Docker Desktop's memory. |
+| Airflow UI never comes up, but the scheduler runs the DAG | The webserver logged `No response from gunicorn master within 120 seconds` and shut itself down. Both webserver timeouts are raised to 300 s in `docker-compose.yml`; a slower machine may need more. |
+| Airflow goes `unhealthy` after a billing run | A gunicorn worker was OOM-killed while the Spark JVM held memory (`Perhaps out of memory?` in the logs). `docker compose restart airflow` brings the UI back; keep the DAG paused between demos so it is not billing every five minutes. |
+| A triggered DAG run never starts | The DAG is paused — it ships that way. `airflow dags unpause daily_billing`, and the queued run begins. |
+| Phase 0 says `airflow running/unhealthy` | The webserver died; see above. The scheduler and the billing job are unaffected, so Phase 4 can still pass while Phase 0 fails. |
+| `wait_for_tariff` fails after three minutes | No tariff file for the day being billed. Either the producer and tariff generator are not running, or you are billing a past day whose file was never written — `python -m sources.tariff_generator --sim-day YYYYMMDD` reproduces it exactly. |
+| A manual DAG trigger sits in `queued` | `max_active_runs=1`, and a scheduled run is holding the slot while its sensor polls. It releases within three minutes, or clear that run in the UI. |
+| `check_phase4.py` says `daily_bill` is empty | No simulated day has been billed yet. A day must *close* first — five real minutes of producer — or bill a past day with `--conf '{"sim_day": "YYYYMMDD"}'`. |
+| `refusing to bill …: the simulated day is still in progress` | Working as intended: bill the previous day, or pass `--allow-open-day` to accept a partial total. |
+| `N household(s) have no row in the … tariff file` | The tariff file predates a change to `grid.zones`. Regenerate it for that day; the job writes nothing rather than billing part of a zone. |
+| Hand calculation disagrees by more than a cent | Not rounding. The script and the batch job read different data or different rules — check that `config.yaml`'s `billing` section has not changed since the day was billed. |
+| The Lambda cross-check shows `no windows` | The speed layer was not running during that simulated day. It is informational only; the batch figure is the authoritative one either way. |

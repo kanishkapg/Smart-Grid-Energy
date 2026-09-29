@@ -26,7 +26,10 @@ EXPECTED_TABLES = ["alerts", "daily_bill", "pipeline_runs", "zone_metrics"]
 # No "raw" bucket: the Parquet master store is a mounted volume, not object
 # storage (see docs/02-tech-stack.md).
 EXPECTED_BUCKETS = ["reports", "tariff"]
-INIT_SERVICES = ("kafka-init", "storage-init")
+# One-shot jobs: these are healthy when they have *exited 0*, not when they are
+# running. `airflow-db-init` joined them in Phase 4 — it creates Airflow's
+# metadata database if it is not there and gets out of the way.
+INIT_SERVICES = ("kafka-init", "storage-init", "airflow-db-init")
 
 
 def compose(*args: str) -> tuple[int, str]:
@@ -92,7 +95,7 @@ def check_containers() -> tuple[bool, list[str]]:
             shown = state + (f"/{health}" if health else "")
 
         ok &= good
-        lines.append(f"{'+' if good else '-'} {service:<13} {shown}")
+        lines.append(f"{'+' if good else '-'} {service:<16} {shown}")
     return ok, lines
 
 

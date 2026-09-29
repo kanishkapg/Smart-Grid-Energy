@@ -86,6 +86,35 @@ SELECT count(*)                                            AS windows,
 """
 
 
+# --- batch layer: daily_bill ----------------------------------------------
+# Rounded through `numeric` and cast back to float8 for the same reason as
+# avg_load_kw above: Postgres has no round(double, int), and a Decimal would be
+# serialised as a JSON string.
+_BILLED_DAYS = """
+SELECT sim_day,
+       count(*)                                    AS households,
+       round(sum(net_kwh)::numeric, 3)::float8     AS net_kwh,
+       round(sum(net_amount)::numeric, 2)::float8  AS net_amount,
+       count(DISTINCT run_id)                      AS runs,
+       max(generated_at)                           AS generated_at
+  FROM daily_bill
+ GROUP BY sim_day
+ ORDER BY sim_day DESC
+ LIMIT %(limit)s
+"""
+
+_BILLS_FOR_DAY = """
+SELECT sim_day, household_id, grid_zone,
+       total_consumption_kwh, total_solar_kwh, net_kwh,
+       tariff_rate, billing_tier, subsidy_flag,
+       gross_amount, subsidy_amount, net_amount,
+       run_id, generated_at
+  FROM daily_bill
+ WHERE sim_day = %(sim_day)s::date
+ ORDER BY household_id
+"""
+
+
 def _query(dsn: str, sql: str, params: dict | None = None) -> list[dict[str, Any]]:
     with psycopg.connect(dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
         cur.execute(sql, params or {})
@@ -110,6 +139,16 @@ def recent_alerts(dsn: str, limit: int, rule: str | None = None,
 
 def alert_counts(dsn: str) -> list[dict[str, Any]]:
     return _query(dsn, _ALERT_COUNTS)
+
+
+def billed_days(dsn: str, limit: int) -> list[dict[str, Any]]:
+    """Which simulated days the batch layer has billed, newest first."""
+    return _query(dsn, _BILLED_DAYS, {"limit": limit})
+
+
+def bills_for_day(dsn: str, sim_day: str) -> list[dict[str, Any]]:
+    """Every household's bill for one simulated day."""
+    return _query(dsn, _BILLS_FOR_DAY, {"sim_day": sim_day})
 
 
 def freshness(dsn: str) -> dict[str, Any]:

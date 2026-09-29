@@ -1,8 +1,8 @@
 """Writes into the serving layer: plain SQL over plain Python values.
 
-Both Lambda layers write here -- the speed layer's `zone_metrics` and `alerts`
-now, the batch layer's `daily_bill` in Phase 4 -- so the idempotency rules live
-in one file instead of being re-derived per job.
+Both Lambda layers write here -- the speed layer's `zone_metrics` and `alerts`,
+the batch layer's `daily_bill` -- so the idempotency rules live in one file
+instead of being re-derived per job.
 
 **Why psycopg rather than Spark's JDBC writer.** Every write in this project has
 to be idempotent, because both layers deliver at-least-once: the streaming query
@@ -53,6 +53,38 @@ ON CONFLICT (window_start, grid_zone) DO UPDATE SET
     updated_at            = now()
 """
 
+# The batch layer's output. PK (sim_day, household_id) is what makes the billing
+# DAG safe to re-run: a retry, or a second run of the same simulated day, rewrites
+# that day's rows instead of double-billing the household. `run_id` is overwritten
+# too, so the row always names the run whose numbers it currently holds.
+DAILY_BILL_COLUMNS: Sequence[str] = (
+    "sim_day", "household_id", "grid_zone",
+    "total_consumption_kwh", "total_solar_kwh", "net_kwh",
+    "tariff_rate", "billing_tier", "subsidy_flag",
+    "gross_amount", "subsidy_amount", "net_amount", "run_id",
+)
+
+_UPSERT_DAILY_BILL = """
+INSERT INTO daily_bill ({columns}, generated_at)
+VALUES ({placeholders}, now())
+ON CONFLICT (sim_day, household_id) DO UPDATE SET
+    grid_zone             = EXCLUDED.grid_zone,
+    total_consumption_kwh = EXCLUDED.total_consumption_kwh,
+    total_solar_kwh       = EXCLUDED.total_solar_kwh,
+    net_kwh               = EXCLUDED.net_kwh,
+    tariff_rate           = EXCLUDED.tariff_rate,
+    billing_tier          = EXCLUDED.billing_tier,
+    subsidy_flag          = EXCLUDED.subsidy_flag,
+    gross_amount          = EXCLUDED.gross_amount,
+    subsidy_amount        = EXCLUDED.subsidy_amount,
+    net_amount            = EXCLUDED.net_amount,
+    run_id                = EXCLUDED.run_id,
+    generated_at          = now()
+""".format(
+    columns=", ".join(DAILY_BILL_COLUMNS),
+    placeholders=", ".join(["%s"] * len(DAILY_BILL_COLUMNS)),
+)
+
 # Alerts are an append-only log of events that happened, so there is no upsert
 # here. Repeats are suppressed before the insert, by the caller's dedupe keys.
 _INSERT_ALERT = """
@@ -61,9 +93,10 @@ VALUES (%s, %s, %s, %s, %s)
 """
 
 _REGISTER_RUN = """
-INSERT INTO pipeline_runs (run_id, component, status, notes)
-VALUES (%s, %s, 'RUNNING', %s)
-ON CONFLICT (run_id) DO UPDATE SET status = 'RUNNING', notes = EXCLUDED.notes
+INSERT INTO pipeline_runs (run_id, component, status, sim_day, notes)
+VALUES (%s, %s, 'RUNNING', %s, %s)
+ON CONFLICT (run_id) DO UPDATE SET
+    status = 'RUNNING', sim_day = EXCLUDED.sim_day, notes = EXCLUDED.notes
 """
 
 # A new run of a component proves any earlier RUNNING row for it is finished,
@@ -120,6 +153,25 @@ def upsert_zone_metrics(conn, rows: Iterable[Dict[str, Any]]) -> int:
     return len(params)
 
 
+def upsert_daily_bills(conn, bills: Iterable[Dict[str, Any]], run_id: str) -> int:
+    """Insert-or-update one simulated day's bills. Returns rows written.
+
+    Every row is stamped with the run that produced it, which is what makes a
+    bill traceable: `daily_bill.run_id` joins to `pipeline_runs` and to the JSON
+    log lines of that execution.
+    """
+    params: List[tuple] = [
+        tuple(run_id if column == "run_id" else bill[column]
+              for column in DAILY_BILL_COLUMNS)
+        for bill in bills
+    ]
+    if not params:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(_UPSERT_DAILY_BILL, params)
+    return len(params)
+
+
 def insert_alerts(conn, alerts: Iterable[Any], run_id: str) -> int:
     """Append raised alerts. `alerts` holds alert_rules.Alert instances."""
     params = [(a.level, a.grid_zone, a.rule, a.message, run_id) for a in alerts]
@@ -130,15 +182,19 @@ def insert_alerts(conn, alerts: Iterable[Any], run_id: str) -> int:
     return len(params)
 
 
-def register_run(dsn: str, run_id: str, component: str, notes: str = "") -> int:
+def register_run(dsn: str, run_id: str, component: str, notes: str = "",
+                 sim_day: Any = None) -> int:
     """Record this execution, and close out any earlier run of the same component.
+
+    `sim_day` is the simulated day a batch run is billing; the streaming jobs
+    leave it null because they are not scoped to a day.
 
     Returns how many stale rows were superseded, which the caller logs: a
     non-zero count is how you find out the previous run was killed rather than
     stopped.
     """
     with connection(dsn) as conn, conn.cursor() as cur:
-        cur.execute(_REGISTER_RUN, (run_id, component, notes))
+        cur.execute(_REGISTER_RUN, (run_id, component, sim_day, notes))
         cur.execute(_SUPERSEDE_RUNS, (run_id, component, run_id))
         return cur.rowcount
 

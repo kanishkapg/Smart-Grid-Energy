@@ -18,8 +18,8 @@ flowchart LR
 
   subgraph BATCH["BATCH LAYER — daily, exact, re-runnable"]
     K -->|"raw sink"| RAW[("Mounted volume / Parquet<br/>data/raw/meter_readings/<br/>sim_day=../grid_zone=..<br/>IMMUTABLE MASTER DATASET")]
-    AF["Airflow DAG<br/>FileSensor on tariff file"] --> BJ
-    RAW --> BJ["Spark batch<br/>consumption ⨝ tariff<br/>net metering + subsidy"]
+    AF["Airflow DAG daily_billing<br/>sensor: tariff object for the sim-day<br/>schedule: every 5 real min = 1 sim-day"] --> BJ
+    RAW --> BJ["billing_batch.py (Spark)<br/>dedupe ⟶ per-household aggregate<br/>⨝ tariff ⟶ net metering + subsidy<br/>upsert on (sim_day, household_id)"]
     M --> BJ
   end
 
@@ -27,7 +27,7 @@ flowchart LR
   BJ --> PG
   BJ --> RPT[("Object storage<br/>reports/")]
 
-  PG --> API["FastAPI<br/>/zones /alerts /health /metrics"]
+  PG --> API["FastAPI<br/>/zones /alerts /bills /health /metrics"]
   PG --> G["Grafana<br/>live monitoring + billing dashboards"]
   SS -. "metrics" .-> P["Prometheus"]
   API -. "metrics" .-> P
@@ -49,10 +49,10 @@ reconciliation) → serve (API + Grafana) → observe (Prometheus/Grafana + JSON
 
 ```mermaid
 flowchart TB
-  CM["processing/shared/<br/>schemas.py · spark_session.py · transforms.py · alert_rules.py · pg.py<br/><b>ONE implementation of the business rules</b>"]
+  CM["processing/shared/<br/>schemas.py · spark_session.py · transforms.py<br/>alert_rules.py · billing.py · pg.py<br/><b>ONE implementation of the business rules</b>"]
   CM --> RS["raw_sink.py<br/>trigger: micro-batch every 15s<br/>source: Kafka<br/>sink: Parquet (append)"]
   CM --> SP["speed_layer.py<br/>trigger: micro-batch every 5s<br/>source: Kafka<br/>sink: zone_metrics + alerts (upsert)"]
-  CM --> BT["batch/billing_job.py<br/>trigger: Airflow, per sim-day<br/>source: Parquet + tariff CSV<br/>sink: daily_bill (upsert)"]
+  CM --> BT["billing_batch.py<br/>trigger: Airflow, per sim-day<br/>source: Parquet + tariff CSV<br/>sink: daily_bill (upsert) + reports/"]
   classDef shared fill:#f3f0ff,stroke:#7048e8,stroke-width:2px
   class CM shared
 ```

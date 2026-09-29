@@ -1,18 +1,21 @@
-"""Phase 3: the real-time metrics API over the serving layer.
+"""Phases 3-4: the read API over the serving layer.
 
     uvicorn serving.api.main:app --reload        # from the project root
     http://localhost:8000/docs                   # generated OpenAPI docs
 
 Answers the "right now" half of the use case -- grid load and renewable
-contribution by zone -- by reading what the speed layer has written to Postgres.
-It runs no analytics of its own: aggregation belongs to the layer that owns the
-stream, and an API that recomputed it would be a second, disagreeing
-implementation.
+contribution by zone -- from what the speed layer has written to Postgres, and
+the "what does it cost" half from what the batch layer has written there. It
+runs no analytics of its own: aggregation belongs to the layer that owns the
+data, and an API that recomputed it would be a second, disagreeing
+implementation. This is Lambda's serving layer: one query surface over both.
 
 Endpoints:
-    GET /zones                  latest window per zone
-    GET /zones/{zone}/load      one zone's recent windows
-    GET /alerts                 recent threshold breaches
+    GET /zones                  latest window per zone          (speed layer)
+    GET /zones/{zone}/load      one zone's recent windows       (speed layer)
+    GET /alerts                 recent threshold breaches       (speed layer)
+    GET /bills                  simulated days that have been billed   (batch)
+    GET /bills/{sim_day}        one day's household bills              (batch)
     GET /health                 liveness + whether the pipeline is still feeding us
     GET /metrics                Prometheus exposition (scraped in Phase 6)
 """
@@ -39,7 +42,7 @@ DSN = cfg.postgres_dsn
 app = FastAPI(
     title="Smart Grid Energy Monitoring API",
     description=__doc__,
-    version="0.3.0",
+    version="0.4.0",
 )
 
 # Gauges rather than counters: each one is a current reading of the grid, and is
@@ -157,6 +160,54 @@ def list_alerts(
     return {"alert_count": len(rows), "alerts": rows}
 
 
+@app.get("/bills", summary="Simulated days the batch layer has billed")
+def list_billed_days(
+    limit: int = Query(14, ge=1, le=365, description="how many days back"),
+) -> dict[str, Any]:
+    """One row per billed simulated day: the batch layer's run history, by day.
+
+    `runs` is how many distinct billing runs wrote the day. It should be 1 --
+    a re-run upserts under the same key but stamps its own run_id on every row,
+    so a 2 means one run only covered part of the day.
+    """
+    rows = read(db.billed_days, DSN, limit)
+
+    return {
+        "currency": cfg.billing["currency"],
+        "day_count": len(rows),
+        "days": rows,
+    }
+
+
+@app.get("/bills/{sim_day}", summary="One simulated day's household bills")
+def day_bills(sim_day: str) -> dict[str, Any]:
+    """Every household's bill for a simulated day, with the day's totals.
+
+    Authoritative, unlike everything under /zones: these numbers were recomputed
+    from the immutable Parquet master store, not estimated from a stream.
+    """
+    day = _normalise_sim_day(sim_day)
+    rows = read(db.bills_for_day, DSN, day)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="no bills stored for {}; the batch layer bills a simulated "
+                   "day once it has closed -- see GET /bills for the days it "
+                   "has".format(day),
+        )
+
+    return {
+        "sim_day": day,
+        "currency": cfg.billing["currency"],
+        "households": len(rows),
+        "households_configured": cfg.total_meters,
+        "total_net_kwh": round(sum(r["net_kwh"] for r in rows), 4),
+        "total_gross_amount": round(sum(r["gross_amount"] for r in rows), 2),
+        "total_subsidy_amount": round(sum(r["subsidy_amount"] for r in rows), 2),
+        "total_net_amount": round(sum(r["net_amount"] for r in rows), 2),
+        "bills": rows,
+    }
+
 @app.get("/health", summary="Liveness and pipeline freshness")
 def health() -> dict[str, Any]:
     """Is the API up, and is the speed layer still feeding it?
@@ -218,3 +269,19 @@ def _renewable_pct(rows: list[dict[str, Any]]) -> float:
     if consumption <= 0:
         return 0.0
     return round(100 * sum(r["total_solar_kwh"] for r in rows) / consumption, 2)
+
+
+def _normalise_sim_day(value: str) -> str:
+    """Accept 2026-01-27 or 20260127, reject anything else here.
+
+    Validated in the API rather than left to Postgres: a malformed date would
+    otherwise come back as a 500 from a failed cast, which says "the server is
+    broken" about what is plainly a client's typo.
+    """
+    digits = value.replace("-", "")
+    if len(digits) != 8 or not digits.isdigit():
+        raise HTTPException(
+            status_code=400,
+            detail="sim_day must be YYYY-MM-DD or YYYYMMDD, not {!r}".format(value),
+        )
+    return "{}-{}-{}".format(digits[:4], digits[4:6], digits[6:8])

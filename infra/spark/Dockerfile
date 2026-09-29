@@ -59,9 +59,14 @@ RUN cd /opt/spark/jars && \
 #
 # Deliberately below the jars: a layer added above them would invalidate the
 # cache and re-download ~250 MB on every rebuild.
+# boto3 is Phase 4: the billing job fetches the day's tariff CSV and drops its
+# report through the S3 API, the same client the producers use. Only 40 rows, so
+# it is read with boto3 rather than by Spark over S3A -- which would mean a
+# 250 MB AWS SDK on the read path for a 2 KB file.
 RUN pip3 install --no-cache-dir \
       "psycopg[binary]==3.2.3" \
-      "backports.zoneinfo==0.2.1"
+      "backports.zoneinfo==0.2.1" \
+      "boto3==1.35.36"
 
 # Structured Streaming checkpoints live on a docker volume, not in object
 # storage: checkpointing needs atomic rename, which S3 only emulates by copying.

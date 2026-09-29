@@ -9,8 +9,10 @@
 #  Phase 2 adds  raw-sink     -> Kafka -> partitioned Parquet master store
 #  Phase 3 adds  speed-layer  -> windowed zone metrics + alerts -> Postgres
 #                api          -> FastAPI real-time metrics endpoints
+#  Phase 4 adds  airflow        -> the daily billing DAG (batch layer)
+#                billing-batch -> the batch job itself, run on demand
 #
-#  Later phases add: airflow, grafana, prometheus.
+#  Later phases add: grafana, prometheus.
 # ===========================================================================
 
 name: ${COMPOSE_PROJECT_NAME:-smartgrid}
@@ -243,10 +245,15 @@ services:
     working_dir: /app
     ports:
       - "4040:4040"      # Spark UI: streaming query progress, stages, storage
+    # 512m, not the 1g this started with. Measured working set is ~450 MB: one
+    # micro-batch of ~1,200 rows and the Parquet writer. The headroom matters
+    # because Phase 4's batch job needs a JVM of its own, and the whole stack
+    # shares one 3.7 GB Docker VM on an 8 GB laptop -- see the README's
+    # "What Phase 4 decides" note on memory.
     command: >
       /opt/spark/bin/spark-submit
       --master local[2]
-      --driver-memory 1g
+      --driver-memory 512m
       /app/processing/raw_sink.py
     restart: unless-stopped
 
@@ -293,10 +300,12 @@ services:
     working_dir: /app
     ports:
       - "4041:4040"      # Spark UI; 4040 is already taken by raw-sink
+    # 512m for the same reason as raw-sink: the state this query holds is four
+    # zones times a handful of open windows.
     command: >
       /opt/spark/bin/spark-submit
       --master local[2]
-      --driver-memory 1g
+      --driver-memory 512m
       /app/processing/speed_layer.py
     restart: unless-stopped
 
@@ -345,7 +354,209 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # -------------------------------------------------------------------------
+  # Phase 4 -- the batch layer, as a one-shot job.
+  #
+  # `profiles: ["manual"]` keeps it out of `docker compose up`: this is not a
+  # service, it is a run. Airflow normally triggers the same job inside its own
+  # container; this service is how a human runs it directly, which is what the
+  # Phase 4 walkthrough does before involving the scheduler.
+  #
+  #     docker compose run --rm billing-batch                     # the day that just closed
+  #     docker compose run --rm billing-batch --sim-day 20260121
+  #
+  # The entrypoint is spark-submit, so anything after the service name is an
+  # argument to the job rather than a new command line.
+  # -------------------------------------------------------------------------
+  billing-batch:
+    profiles: ["manual"]
+    build:
+      context: ./infra/spark
+    image: smartgrid/spark:3.5.3
+    logging: *default-logging
+    environment:
+      SG_IN_DOCKER: "1"
+      PYTHONPATH: /app
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://seaweedfs:8333}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-smartgrid}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-smartgridsecret}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET_TARIFF: ${S3_BUCKET_TARIFF:-tariff}
+      S3_BUCKET_REPORTS: ${S3_BUCKET_REPORTS:-reports}
+    volumes:
+      - ./common:/app/common:ro
+      - ./processing:/app/processing:ro
+      - ./config:/app/config:ro
+      # Both paths onto ./data, for the same reason as the airflow service:
+      # /app/data is where the simulated clock looks for .sim_anchor, and
+      # /data/raw is the master store as config.yaml names it inside containers.
+      - ./data:/app/data
+      - ./data:/data
+    working_dir: /app
+    entrypoint:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      # Matching the DAG, which runs the same job in a tighter container.
+      - --driver-memory
+      - 512m
+      - /app/processing/billing_batch.py
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Phase 4 -- Airflow's metadata database.
+  #
+  # Airflow needs a database of its own for LocalExecutor (SQLite only supports
+  # the SequentialExecutor, which cannot run two tasks at once). It gets a second
+  # database inside the existing Postgres rather than a second container: one less
+  # service for a laptop, and the isolation that matters -- Airflow's tables and
+  # the serving tables never mixing -- is what a separate database gives.
+  #
+  # Not done in infra/postgres/init/, because those scripts only run when the
+  # data volume is created; this way an existing stack gains Phase 4 without
+  # being wiped.
+  # -------------------------------------------------------------------------
+  airflow-db-init:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: sg-airflow-db-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-grid}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+      PGDATABASE: ${POSTGRES_DB:-smartgrid}
+      AIRFLOW_DB: ${AIRFLOW_DB:-airflow}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if psql -tAc "SELECT 1 FROM pg_database WHERE datname='$$AIRFLOW_DB'" | grep -q 1; then
+          echo "metadata database $$AIRFLOW_DB already exists"
+        else
+          psql -c "CREATE DATABASE $$AIRFLOW_DB OWNER $$PGUSER"
+          echo "created metadata database $$AIRFLOW_DB"
+        fi
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Phase 4 -- Airflow: the batch layer's scheduler.
+  #
+  # `airflow standalone` runs the scheduler, the webserver and the triggerer in
+  # one process. Three containers is the production shape; one is the right shape
+  # for a single DAG on a laptop that is already running two Spark drivers.
+  #
+  # This image carries PySpark, so the DAG runs the billing job as a subprocess
+  # rather than asking the Docker daemon to start another container -- reasoning
+  # in infra/airflow/Dockerfile.
+  # -------------------------------------------------------------------------
+  airflow:
+    build:
+      context: ./infra/airflow
+    image: smartgrid/airflow:2.10.3
+    container_name: sg-airflow
+    logging: *default-logging
+    depends_on:
+      airflow-db-init:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      SG_IN_DOCKER: "1"
+      PYTHONPATH: /app
+      # --- the serving layer the billing job writes to ---------------------
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+      # --- object storage: the tariff input and the report output -----------
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://seaweedfs:8333}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-smartgrid}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-smartgridsecret}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET_TARIFF: ${S3_BUCKET_TARIFF:-tariff}
+      S3_BUCKET_REPORTS: ${S3_BUCKET_REPORTS:-reports}
+      # --- Airflow itself ---------------------------------------------------
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-grid}:${POSTGRES_PASSWORD:-gridpass}@postgres:5432/${AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Paused on creation, which is Airflow's own default and the right one here.
+      # Unpaused, this DAG starts a Spark JVM every five real minutes for as long
+      # as the stack is up. On an 8 GB laptop that is enough to get the Airflow
+      # webserver OOM-killed mid-billing ("Worker was sent SIGKILL! Perhaps out of
+      # memory?"), and before the producer is running it also fills the run history
+      # with red runs whose tariff file was never written. Billing is started
+      # deliberately instead:
+      #     docker compose exec airflow airflow dags unpause daily_billing
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      # Picked up quickly after an edit on the host; the default is 5 minutes.
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+      # One DAG file, so a second parsing process is pure overhead -- and this
+      # container has to leave room for the Spark driver the billing task starts.
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+      # The default is 4 gunicorn workers. One is enough for a single DAG, and
+      # the memory matters: this container also hosts the Spark driver that the
+      # billing task starts, inside a Docker VM with 3.7 GB in total.
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      # Both defaults are 120s, and both were exceeded on this laptop: the
+      # webserver logged "No response from gunicorn master within 120 seconds"
+      # and shut itself down while the scheduler carried on running the DAG. A
+      # bind-mounted dags folder on Docker Desktop is slow enough that importing
+      # the provider packages takes longer than that.
+      AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
+      AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./orchestration/dags:/opt/airflow/dags:ro
+      - ./common:/app/common:ro
+      - ./processing:/app/processing:ro
+      - ./config:/app/config:ro
+      # ./data twice, at two paths, for two different readers of the same files:
+      #   /app/data  -- where common/sim_clock.py looks for .sim_anchor, since the
+      #                 project root inside this container is /app
+      #   /data      -- the Parquet master store at the path config.yaml gives
+      #                 containers (storage.raw_root_container)
+      - ./data:/app/data
+      - ./data:/data
+      - airflow-logs:/opt/airflow/logs
+    working_dir: /app
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        # A known password instead of the random one `airflow standalone` writes to
+        # a file inside the container. `|| true` because the user survives a
+        # restart while this command does not know that.
+        airflow users create --role Admin           --username "$${AIRFLOW_ADMIN_USER}" --password "$${AIRFLOW_ADMIN_PASSWORD}"           --firstname Smart --lastname Grid --email admin@smartgrid.local || true
+        exec airflow standalone
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      # The first start runs the migrations and boots three Airflow components.
+      start_period: 300s
+    restart: unless-stopped
+
 volumes:
   seaweed-data:
   postgres-data:
   spark-checkpoints:
+  # Airflow's task logs. A named volume rather than a bind mount: Airflow writes
+  # them as uid 50000, and a host-mounted log tree is the usual source of
+  # permission errors on Windows and Linux alike. Read them from the UI, or with
+  # `docker compose logs airflow`.
+  airflow-logs:

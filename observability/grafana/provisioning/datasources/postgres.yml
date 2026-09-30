@@ -1,0 +1,23 @@
+# Phase 5: the serving database as Grafana's one datasource.
+#
+# Provisioned rather than clicked together, so `docker compose up` on a fresh
+# clone yields working dashboards. The fixed uid is what the dashboard JSON
+# files reference. Credentials come from the container environment, which
+# docker-compose.yml fills from .env -- nothing secret is written here.
+apiVersion: 1
+
+datasources:
+  - name: SmartGrid Postgres
+    uid: sg-postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: $POSTGRES_USER
+    isDefault: true
+    editable: false
+    jsonData:
+      database: $POSTGRES_DB
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: $POSTGRES_PASSWORD

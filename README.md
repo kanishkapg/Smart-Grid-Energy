@@ -71,8 +71,8 @@ events.
 | **2** | Raw master store: Spark Structured Streaming → partitioned Parquet | `scripts/check_phase2.py` reconciles Parquet against Kafka | ✅ |
 | **3** | Speed layer (windowed zone metrics + alerts) + FastAPI real-time API | `scripts/check_phase3.py` prints a green checkpoint; `--cloud-cover` fires an alert | ✅ |
 | **4** | Batch billing (Spark) + Airflow DAG | `scripts/check_phase4.py` re-derives a bill from Parquet and matches `daily_bill` | ✅ |
-| 5 | Grafana dashboards | two rendering dashboards | ⏳ |
-| 6 | Observability hardening | kill the producer → "no data" alert fires | ⏳ |
+| **5** | Grafana dashboards: live zone monitoring + daily billing | `scripts/check_phase5.py` runs every panel's query through Grafana | ✅ |
+| **6** | Observability: Prometheus metrics + alert rules, Pipeline Health dashboard | stop the producer → `check_phase6.py --expect-firing NoMeterData` passes | ✅ |
 | 7 | Report, README, demo | clean-clone reproduce | ⏳ |
 
 ---
@@ -99,6 +99,8 @@ scripts are one-shot and can share one.
 
 The batch layer needs no terminal of its own: Airflow runs it inside the stack,
 on a schedule. Its UI is at **http://localhost:8080** (`admin` / `admin`).
+The dashboards are at **http://localhost:3000** (`admin` / `admin`), and
+Prometheus with its alert rules at **http://localhost:9090/alerts**.
 
 Every terminal needs the environment activated (`conda activate bigdata`) and the
 project root as its working directory.
@@ -122,6 +124,8 @@ python scripts\check_phase1.py      # PHASE 1 CHECKPOINT: PASSED
 python scripts\check_phase2.py      # PHASE 2 CHECKPOINT: PASSED
 python scripts\check_phase3.py      # PHASE 3 CHECKPOINT: PASSED
 python scripts\check_phase4.py      # PHASE 4 CHECKPOINT: PASSED
+python scripts\check_phase5.py      # PHASE 5 CHECKPOINT: PASSED
+python scripts\check_phase6.py      # PHASE 6 CHECKPOINT: PASSED
 ```
 
 ### What each one proves, and how long to wait first
@@ -1257,6 +1261,95 @@ cannot offer, and the reason the batch layer is the authoritative one.
 
 ---
 
+## Verifying Phase 5, step by step
+
+Phase 5 adds **Grafana** over the serving layer: one dashboard per Lambda layer,
+both reading Postgres directly. Nothing is configured by hand — the datasource and
+both dashboards are provisioned from `observability/grafana/`, so a fresh clone
+gets them on `docker compose up`.
+
+| Dashboard | Reads | Shows |
+|---|---|---|
+| **Live Zone Monitoring** (`/d/sg-live`) | `zone_metrics`, `alerts` | renewable % and load per zone, simulated clock, freshness, active meters, alerts |
+| **Daily Billing** (`/d/sg-billing`) | `daily_bill` | day totals, zone consumption vs solar, zone solar share, top 10 bills, lowest-revenue households, revenue by day, every bill |
+
+```powershell
+docker compose up -d grafana
+python scripts\check_phase5.py      # PHASE 5 CHECKPOINT: PASSED
+```
+
+Open **http://localhost:3000** (`admin` / `admin`); the home page is the live
+dashboard, refreshing every 10 s. The billing dashboard has a *Simulated day*
+selector that defaults to the newest billed day.
+
+The checkpoint script sends every panel's SQL back through Grafana's own query API
+(`/api/ds/query`), the path the browser uses, so it proves the datasource, its
+credentials, Grafana's macros and each query — not just that Grafana is up. The
+`Recent alerts` panels may legitimately be empty; every other panel must return rows.
+
+### What Phase 5 decides, and why
+
+| Decision | Reason |
+|---|---|
+| Live charts plot each window at **`updated_at`**, not `window_start` | `window_start` is simulated time (January 2026); Grafana's time picker is real time, so those points would fall outside every range and the panels would say "No data". `updated_at` is the real time the speed layer last wrote the window — processing time — so "last 30 minutes" means what it says: six simulated days. The simulated window is shown as text in the *Simulated clock* tile. |
+| Stat tiles use the **latest complete** window | The same rule as the API's `/zones`: the open window is still filling, and showing it would make the numbers sag every ~12 s. |
+| Renewable tiles turn red **below 15%** | The speed layer's `low_renewable_pct` alert threshold, so the colour and the alert log never disagree. |
+| The billing dashboard is keyed on a **`sim_day` variable**, not the time picker | A bill belongs to a simulated date; the variable lists exactly the days `daily_bill` holds. |
+| **"Lowest-revenue"** rather than "loss-making" households | Under import-only net metering nobody is paid for exports, so no bill is negative. What the utility actually forgoes is solar offset plus subsidy, and that panel shows both. |
+| Provisioned, read-only dashboards (`allowUiUpdates: false`) | The JSON in the repo is the source of truth. A UI edit that is not saved back to the file would vanish on the next `docker compose up` anyway. |
+
+---
+
+## Verifying Phase 6, step by step
+
+Phase 6 makes the pipeline **observable**: structured logs with correlation ids
+(in place since Phase 0), Prometheus metrics, operational alert rules — including
+the **"no meter data" health check** — and a Grafana *Pipeline Health* dashboard.
+
+| Signal | Where it comes from | Metric / location |
+|---|---|---|
+| Events/s | the producer, `http://localhost:9101/metrics` | `smartgrid_producer_events_total`, `..._late_events_total` |
+| End-to-end lag | the API, from `zone_metrics.updated_at` | `smartgrid_serving_lag_seconds` |
+| Batch duration | the API, from `pipeline_runs` | `smartgrid_batch_last_duration_seconds` |
+| Error counts | producer delivery callback, API, `pipeline_runs` | `..._producer_send_errors_total`, `smartgrid_api_errors_total`, `smartgrid_pipeline_runs{status="FAILED"}` |
+| Correlation ids | every JSON log line, `pipeline_runs`, `daily_bill.run_id`, `alerts.run_id` | *Recent pipeline runs* table |
+
+Alert rules (`observability/prometheus/alert_rules.yml`):
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| **NoMeterData** | no zone window has reached Postgres for > 30 s (10 s `for`) | critical |
+| ProducerDown | Prometheus cannot scrape the producer for 20 s | warning |
+| ProducerSendErrors | Kafka rejected any reading in the last 5 min | warning |
+| ApiDown | the API's `/metrics` is unreachable for 20 s | critical |
+| BillingRunFailed | a `billing_batch` run was recorded `FAILED` in the last 15 min | warning |
+
+```powershell
+docker compose up -d prometheus
+docker compose restart api grafana               # new API metrics, new Grafana datasource
+python -m sources.stream_producer --log-format console   # restart: the metrics endpoint is new
+python scripts\check_phase6.py                   # healthy: PHASE 6 CHECKPOINT: PASSED
+# now stop the producer (Ctrl+C), then:
+python scripts\check_phase6.py --expect-firing NoMeterData
+```
+
+The second run polls Prometheus until `NoMeterData` reaches `firing` — about 40–50 s
+after the producer stops (30 s threshold, 10 s `for`, one scrape interval). The same
+alert is visible at http://localhost:9090/alerts and on http://localhost:3000/d/sg-ops.
+Restart the producer and it resolves within one scrape.
+
+### What Phase 6 decides, and why
+
+| Decision | Reason |
+|---|---|
+| The health check measures **the end of the pipeline** | `NoMeterData` watches when a zone window last reached Postgres, so it fires whichever stage stopped — producer, Kafka or the speed layer. `ProducerDown` then says *which*. |
+| Health checks are **Prometheus rules**, not rows in `alerts` | They fire on the *absence* of data, which a streaming job cannot observe: with no input, it runs no micro-batch and has nothing to evaluate. |
+| No Alertmanager | Firing state is visible in Prometheus and Grafana, which is the rubric's "working alert". Routing to email or Slack is one more container and a receiver config — the documented next step. |
+| The API computes lag and run metrics from Postgres at scrape time | The API stays stateless; the serving database is already the one place both layers write to. |
+| The producer exposes its own `/metrics` on the host | It is the only component outside Docker, and its throughput is the one number nothing downstream can measure honestly: a Kafka backlog hides a slow producer. |
+
+---
+
 ## What Phase 0 stood up
 
 | Service | Host endpoint | Purpose |
@@ -1308,7 +1401,9 @@ Three deliberate choices worth knowing:
 │  ├─ check_phase1.py          # Phase 1 checkpoint verifier
 │  ├─ check_phase2.py          # Phase 2 checkpoint verifier
 │  ├─ check_phase3.py          # Phase 3 checkpoint verifier
-│  └─ check_phase4.py          # Phase 4 checkpoint verifier
+│  ├─ check_phase4.py          # Phase 4 checkpoint verifier
+│  ├─ check_phase5.py          # Phase 5 checkpoint verifier
+│  └─ check_phase6.py          # Phase 6 checkpoint verifier
 ├─ tests/                      # 106 tests, no Docker or JVM required
 ├─ sources/
 │  ├─ meter_model.py           # meter population + reading physics (pure, tested)
@@ -1330,7 +1425,10 @@ Three deliberate choices worth knowing:
 ├─ serving/api/
 │  ├─ main.py                  # Phase 3-4: FastAPI endpoints
 │  └─ db.py                    # read-side queries (reads only, never writes)
-├─ observability/              # Phase 6: prometheus + grafana config
+├─ observability/
+│  ├─ grafana/provisioning/    # Phase 5-6: Postgres + Prometheus datasources, dashboard loader
+│  ├─ grafana/dashboards/      # live zone monitoring, daily billing, pipeline health (JSON)
+│  └─ prometheus/              # Phase 6: scrape config + alert rules
 └─ reports/                    # generated billing report samples
 ```
 
@@ -1375,4 +1473,9 @@ Three deliberate choices worth knowing:
 | `refusing to bill …: the simulated day is still in progress` | Working as intended: bill the previous day, or pass `--allow-open-day` to accept a partial total. |
 | `N household(s) have no row in the … tariff file` | The tariff file predates a change to `grid.zones`. Regenerate it for that day; the job writes nothing rather than billing part of a zone. |
 | Hand calculation disagrees by more than a cent | Not rounding. The script and the batch job read different data or different rules — check that `config.yaml`'s `billing` section has not changed since the day was billed. |
+| `check_phase6.py`: producer `down (... connection refused)` | The producer is not running, or was started before Phase 6 and has no metrics endpoint. Restart it; the log shows `metrics_endpoint url=http://localhost:9101/metrics`. |
+| Producer target down with a timeout rather than `connection refused` | Windows Firewall is blocking Docker from reaching Python on port 9101. Allow `python.exe` on private networks when prompted, or add an inbound rule for TCP 9101. |
+| `OSError: address already in use` from the producer | Another producer is already running and owns port 9101. Only one should run; stop the other. |
+| A Grafana panel says "No data" | Run `python scripts\check_phase5.py`: it names the panel and the query error. Live charts are empty if the speed layer has not written in the selected time range; billing panels are empty until a day is billed. |
+| Grafana logs `level=error` about `provisioning/plugins`, `provisioning/alerting` or `xychart` at startup | Harmless: those provisioning folders are optional, and the `xychart` line is Grafana 11.3 noise. The lines that matter are `inserting datasource` and `finished to provision dashboards`. |
 | The Lambda cross-check shows `no windows` | The speed layer was not running during that simulated day. It is informational only; the batch figure is the authoritative one either way. |

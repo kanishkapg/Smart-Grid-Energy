@@ -33,6 +33,15 @@ ARG AWS_SDK_VERSION=1.12.262
 RUN pip3 install --no-cache-dir PyYAML==6.0.2 structlog==24.4.0
 
 ARG MAVEN=https://repo1.maven.org/maven2
+# `fetch` retries and resumes (`-C -`) rather than failing: the AWS bundle is
+# ~280 MB, and on a slow link one dropped connection otherwise kills the build
+# with curl exit 18 ("partial file"). A shell loop, not curl's --retry, because
+# --retry does not treat a dropped transfer as retryable.
+RUN printf '%s\n' '#!/bin/sh' \
+      'for i in 1 2 3 4 5 6 7 8 9 10; do' \
+      '  curl -fsSL -C - -O "$1" && exit 0' \
+      '  echo "retry $i: $(basename "$1")"; sleep 5' \
+      'done; exit 1' > /usr/local/bin/fetch && chmod +x /usr/local/bin/fetch
 RUN set -eu; cd /opt/spark/jars; \
     for url in \
       "$MAVEN/org/apache/spark/spark-sql-kafka-0-10_$SCALA_VERSION/$SPARK_VERSION/spark-sql-kafka-0-10_$SCALA_VERSION-$SPARK_VERSION.jar" \
@@ -41,7 +50,7 @@ RUN set -eu; cd /opt/spark/jars; \
       "$MAVEN/org/apache/commons/commons-pool2/$COMMONS_POOL2_VERSION/commons-pool2-$COMMONS_POOL2_VERSION.jar" \
       "$MAVEN/org/apache/hadoop/hadoop-aws/$HADOOP_AWS_VERSION/hadoop-aws-$HADOOP_AWS_VERSION.jar" \
       "$MAVEN/com/amazonaws/aws-java-sdk-bundle/$AWS_SDK_VERSION/aws-java-sdk-bundle-$AWS_SDK_VERSION.jar" \
-    ; do echo "fetching $(basename "$url")"; curl -fsSLO "$url"; done
+    ; do echo "fetching $(basename "$url")"; fetch "$url"; done
 
 # The S3A "magic" committer, which commits by completing a multipart upload
 # instead of renaming from a _temporary directory. Object stores have no rename,
@@ -49,7 +58,7 @@ RUN set -eu; cd /opt/spark/jars; \
 # paths this job writes. In its own layer so adding it does not re-download the
 # large AWS bundle above.
 RUN cd /opt/spark/jars && \
-    curl -fsSLO "$MAVEN/org/apache/spark/spark-hadoop-cloud_$SCALA_VERSION/$SPARK_VERSION/spark-hadoop-cloud_$SCALA_VERSION-$SPARK_VERSION.jar"
+    fetch "$MAVEN/org/apache/spark/spark-hadoop-cloud_$SCALA_VERSION/$SPARK_VERSION/spark-hadoop-cloud_$SCALA_VERSION-$SPARK_VERSION.jar"
 
 # Phase 3: both Spark layers write to the serving database through psycopg
 # rather than through Spark's JDBC writer, because every write has to be an

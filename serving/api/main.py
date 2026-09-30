@@ -26,7 +26,7 @@ from typing import Any
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Query, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 
 from common.config import load_config
 from common.logging_setup import new_run_id, setup_logging
@@ -66,6 +66,18 @@ LAG_GAUGE = Gauge(
 ALERT_GAUGE = Gauge(
     "smartgrid_alerts_total", "Alerts stored, by rule and level", ["rule", "level"])
 
+# Phase 6: the batch layer and the API's own failures. Runs come from
+# pipeline_runs, where every Spark job records itself; the error counter is the
+# one piece of state the API keeps, because nothing else sees its failed requests.
+RUNS_GAUGE = Gauge(
+    "smartgrid_pipeline_runs", "Recorded pipeline runs, by component and status",
+    ["component", "status"])
+BATCH_DURATION_GAUGE = Gauge(
+    "smartgrid_batch_last_duration_seconds",
+    "Real seconds the newest successful billing run took")
+API_ERRORS = Counter(
+    "smartgrid_api_errors_total", "Requests failed by a database problem", ["kind"])
+
 
 def read(query, *args, **kwargs):
     """Run one read-side query, mapping database failures onto honest statuses.
@@ -80,10 +92,12 @@ def read(query, *args, **kwargs):
     try:
         return query(*args, **kwargs)
     except psycopg.OperationalError as exc:
+        API_ERRORS.labels(kind="database_unavailable").inc()
         log.error("database_unavailable", error=str(exc))
         raise HTTPException(status_code=503,
                             detail="serving database unavailable") from exc
     except psycopg.Error as exc:
+        API_ERRORS.labels(kind="query_failed").inc()
         log.error("query_failed", error=str(exc), query=getattr(query, "__name__", "?"))
         raise HTTPException(status_code=500,
                             detail="serving query failed") from exc
@@ -255,6 +269,11 @@ def metrics() -> Response:
     LAG_GAUGE.set(float(state["seconds_since_last_write"] or 0.0))
     for row in counts:
         ALERT_GAUGE.labels(rule=row["rule"], level=row["level"]).set(row["total"])
+    for row in read(db.run_counts, DSN):
+        RUNS_GAUGE.labels(component=row["component"], status=row["status"]).set(row["runs"])
+    duration = read(db.last_batch_duration, DSN)
+    if duration is not None:
+        BATCH_DURATION_GAUGE.set(duration)
 
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 

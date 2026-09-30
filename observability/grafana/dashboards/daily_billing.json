@@ -1,0 +1,208 @@
+{
+  "uid": "sg-billing",
+  "title": "Smart Grid - Daily Billing",
+  "description": "Batch layer: the authoritative per-household bills in daily_bill, written by the Airflow billing DAG. Pick a simulated day at the top; it defaults to the newest billed day. The time picker is not used: sim_day is a simulated date.",
+  "tags": ["smartgrid", "batch-layer"],
+  "timezone": "browser",
+  "refresh": "1m",
+  "time": { "from": "now-30m", "to": "now" },
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "annotations": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "name": "sim_day",
+        "label": "Simulated day",
+        "type": "query",
+        "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+        "definition": "SELECT DISTINCT sim_day::text FROM daily_bill ORDER BY 1 DESC",
+        "query": "SELECT DISTINCT sim_day::text FROM daily_bill ORDER BY 1 DESC",
+        "refresh": 1,
+        "sort": 0,
+        "multi": false,
+        "includeAll": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Day totals - $sim_day",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*)                                     AS \"Households billed\",\n       round(sum(total_consumption_kwh)::numeric, 1) AS \"Consumption (kWh)\",\n       round(sum(total_solar_kwh)::numeric, 1)       AS \"Solar (kWh)\",\n       round(sum(net_kwh)::numeric, 1)               AS \"Net billed (kWh)\",\n       round(sum(subsidy_amount)::numeric, 2)        AS \"Subsidy (LKR)\",\n       round(sum(net_amount)::numeric, 2)            AS \"Revenue (LKR)\"\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "orientation": "vertical"
+      }
+    },
+    {
+      "id": 2,
+      "type": "barchart",
+      "title": "Consumption vs solar generation by zone (kWh)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT grid_zone,\n       round(sum(total_consumption_kwh)::numeric, 2) AS \"Consumption\",\n       round(sum(total_solar_kwh)::numeric, 2)       AS \"Solar\"\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date\n GROUP BY grid_zone\n ORDER BY grid_zone"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "kwatth", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80, "lineWidth": 1 } },
+        "overrides": []
+      },
+      "options": {
+        "xField": "grid_zone",
+        "orientation": "vertical",
+        "stacking": "none",
+        "showValue": "auto",
+        "groupWidth": 0.7,
+        "barWidth": 0.9,
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Zone solar contribution",
+      "description": "Solar share = solar generated / energy consumed, over the whole simulated day.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT grid_zone                                     AS \"Zone\",\n       count(*)                                      AS \"Households\",\n       round(sum(total_consumption_kwh)::numeric, 2) AS \"Consumption kWh\",\n       round(sum(total_solar_kwh)::numeric, 2)       AS \"Solar kWh\",\n       round((100 * sum(total_solar_kwh) / NULLIF(sum(total_consumption_kwh), 0))::numeric, 1) AS \"Solar share %\",\n       round(sum(net_amount)::numeric, 2)            AS \"Revenue LKR\"\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date\n GROUP BY grid_zone\n ORDER BY grid_zone"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "cellHeight": "sm" }
+    },
+    {
+      "id": 4,
+      "type": "bargauge",
+      "title": "Top 10 households by bill (LKR)",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT household_id, net_amount AS \"Bill\"\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date\n ORDER BY net_amount DESC\n LIMIT 10"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "min": 0, "color": { "mode": "continuous-BlYlRd" } },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": [], "fields": "", "values": true },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Lowest-revenue households (solar offset + subsidy)",
+      "description": "Where the utility earns least: solar covering most of the household's own use (import-only net metering bills max(used - solar, 0)), and the 10% subsidy on top.",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT household_id AS \"Household\",\n       grid_zone    AS \"Zone\",\n       round(total_consumption_kwh::numeric, 2) AS \"Used kWh\",\n       round(total_solar_kwh::numeric, 2)       AS \"Solar kWh\",\n       round((100 * total_solar_kwh / NULLIF(total_consumption_kwh, 0))::numeric, 1) AS \"Solar offset %\",\n       subsidy_flag   AS \"Subsidised\",\n       subsidy_amount AS \"Subsidy LKR\",\n       net_amount     AS \"Bill LKR\"\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date\n ORDER BY net_amount ASC\n LIMIT 10"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "cellHeight": "sm" }
+    },
+    {
+      "id": 6,
+      "type": "barchart",
+      "title": "Revenue and subsidy by simulated day (last 14 billed days, LKR)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT * FROM (\n  SELECT sim_day::text                        AS \"Simulated day\",\n         round(sum(net_amount)::numeric, 2)     AS \"Revenue\",\n         round(sum(subsidy_amount)::numeric, 2) AS \"Subsidy\"\n    FROM daily_bill\n   GROUP BY sim_day\n   ORDER BY sim_day DESC\n   LIMIT 14\n) recent ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80, "lineWidth": 1 } },
+        "overrides": []
+      },
+      "options": {
+        "xField": "Simulated day",
+        "orientation": "vertical",
+        "stacking": "none",
+        "showValue": "auto",
+        "groupWidth": 0.7,
+        "barWidth": 0.9,
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "All bills - $sim_day",
+      "description": "The daily consolidated billing report, as stored. The same rows are published as s3://reports/billing_YYYYMMDD.csv. run_id traces each row to the batch run and its logs.",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 31 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "sg-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT household_id, grid_zone, billing_tier,\n       round(total_consumption_kwh::numeric, 3) AS total_consumption_kwh,\n       round(total_solar_kwh::numeric, 3)       AS total_solar_kwh,\n       round(net_kwh::numeric, 3)               AS net_kwh,\n       tariff_rate, subsidy_flag, gross_amount, subsidy_amount, net_amount, run_id\n  FROM daily_bill\n WHERE sim_day = '$sim_day'::date\n ORDER BY household_id"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "cellHeight": "sm" }
+    }
+  ]
+}

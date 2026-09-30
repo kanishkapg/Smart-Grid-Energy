@@ -1,0 +1,57 @@
+# Phase 6: alert rules. Firing alerts show at http://localhost:9090/alerts and on
+# the Grafana "Pipeline Health" dashboard (through the built-in ALERTS series).
+#
+# Business alerts (low renewable, zone overload) are raised by the speed layer
+# into the `alerts` table. These are the operational ones: is the pipeline alive?
+groups:
+  - name: smartgrid-health
+    rules:
+      # The health check. Measured at the end of the pipeline -- when did a zone
+      # window last reach the serving database -- so it fires whichever stage
+      # stopped: producer, Kafka or speed layer. 30 s is config.yaml's
+      # alerts.no_data_real_seconds, the same threshold as the API's /health.
+      - alert: NoMeterData
+        expr: smartgrid_serving_lag_seconds > 30
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No meter data for {{ $value | humanize }}s"
+          description: "No zone window has reached Postgres for over 30 real seconds (~2.4 simulated hours). Check the producer, then docker compose logs speed-layer."
+
+      # Pinpoints the usual cause of the alert above.
+      - alert: ProducerDown
+        expr: up{job="producer"} == 0
+        for: 20s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Meter producer is not running"
+          description: "Prometheus cannot scrape host.docker.internal:9101. Start python -m sources.stream_producer."
+
+      - alert: ProducerSendErrors
+        expr: increase(smartgrid_producer_send_errors_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka rejected {{ $value | humanize }} meter readings in 5 minutes"
+          description: "See the producer's send_failed log lines; the broker may be down."
+
+      # Without this, a dead API would silently silence NoMeterData: its only
+      # input comes from the API's /metrics.
+      - alert: ApiDown
+        expr: up{job="api"} == 0
+        for: 20s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Serving API is down"
+          description: "docker compose logs --tail 40 api"
+
+      - alert: BillingRunFailed
+        expr: delta(smartgrid_pipeline_runs{component="billing_batch", status="FAILED"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A billing run failed in the last 15 minutes"
+          description: "SELECT * FROM pipeline_runs WHERE status = 'FAILED' ORDER BY started_at DESC; the run_id leads to the Airflow task log."

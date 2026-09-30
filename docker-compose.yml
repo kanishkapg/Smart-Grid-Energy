@@ -11,8 +11,8 @@
 #                api          -> FastAPI real-time metrics endpoints
 #  Phase 4 adds  airflow        -> the daily billing DAG (batch layer)
 #                billing-batch -> the batch job itself, run on demand
-#
-#  Later phases add: grafana, prometheus.
+#  Phase 5 adds  grafana        -> live zone + daily billing dashboards
+#  Phase 6 adds  prometheus     -> metrics scraping + health-check alert rules
 # ===========================================================================
 
 name: ${COMPOSE_PROJECT_NAME:-smartgrid}
@@ -549,6 +549,80 @@ services:
       retries: 10
       # The first start runs the migrations and boots three Airflow components.
       start_period: 300s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Phase 5 -- Grafana: the dashboards over the serving layer.
+  #
+  # Reads Postgres directly, like the API: the speed layer's zone_metrics and
+  # alerts, and the batch layer's daily_bill, side by side in one tool. The
+  # datasource and both dashboards are provisioned from observability/grafana/,
+  # so a fresh clone gets working dashboards with no clicking. No named volume:
+  # everything worth keeping is in those files, and Grafana's own SQLite only
+  # holds sessions and preferences.
+  # -------------------------------------------------------------------------
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.3.0}
+    container_name: sg-grafana
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Read by provisioning/datasources/postgres.yml.
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/live_zone_monitoring.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Phase 6 -- Prometheus: metrics and operational alert rules.
+  #
+  # Scrapes the API (serving lag, pipeline runs) and the host-side producer
+  # (events/s, send errors), and evaluates observability/prometheus/
+  # alert_rules.yml -- including the "no meter data" health check. No
+  # Alertmanager: firing alerts are shown in Prometheus and in Grafana, which is
+  # what this project needs; routing them to email or Slack would be the next step.
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v2.55.1}
+    container_name: sg-prometheus
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Short retention: this is a demo stack, and metrics only need to cover it.
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    # Docker Desktop resolves host.docker.internal on its own; on Linux this
+    # mapping is what lets Prometheus reach the producer on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
 volumes:

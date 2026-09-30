@@ -228,3 +228,11 @@ logging:
   # Every component stamps this correlation id on each log line and on the
   # rows it writes, so serving-layer data is traceable to a pipeline run.
   run_id_env_var: "SG_RUN_ID"
+
+# ---------------------------------------------------------------------------
+# Observability (Phase 6)
+# ---------------------------------------------------------------------------
+observability:
+  # The producer runs on the host, so Prometheus (in Docker) scrapes it at
+  # host.docker.internal:<this port>. 0 disables the endpoint.
+  producer_metrics_port: 9101

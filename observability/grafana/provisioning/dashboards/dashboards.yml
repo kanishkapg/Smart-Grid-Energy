@@ -1,0 +1,15 @@
+# Phase 5: load every dashboard JSON in /etc/grafana/dashboards.
+#
+# The files in observability/grafana/dashboards/ are the source of truth, so UI
+# edits are not saved back: change the JSON and Grafana reloads it within 30 s.
+apiVersion: 1
+
+providers:
+  - name: smartgrid
+    folder: Smart Grid
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards

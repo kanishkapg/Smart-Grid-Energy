@@ -62,8 +62,9 @@ CREATE INDEX IF NOT EXISTS ix_daily_bill_day_zone
     ON daily_bill (sim_day DESC, grid_zone);
 
 -- ---------------------------------------------------------------------------
--- Alerts raised by the speed layer (threshold breaches) and by the
--- health-check rules added in Phase 6.
+-- Business alerts raised by the speed layer (threshold breaches). The Phase 6
+-- health checks ("no meter data" etc.) are Prometheus rules instead: they fire
+-- on the *absence* of data, which no stream job can observe from inside.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id   BIGSERIAL   PRIMARY KEY,

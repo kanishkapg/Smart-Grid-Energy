@@ -21,6 +21,7 @@ import time
 from datetime import timedelta
 
 from kafka import KafkaProducer
+from prometheus_client import Counter, start_http_server
 
 from common.config import load_config
 from common.logging_setup import log_startup, new_run_id, setup_logging
@@ -28,6 +29,12 @@ from common.sim_clock import SimClock
 from sources.meter_model import build_meters, make_reading
 
 _running = True
+
+# Phase 6: scraped by Prometheus. Counters, so rate() gives events/s and a
+# producer restart (reset to 0) is handled by Prometheus rather than here.
+EVENTS_SENT = Counter("smartgrid_producer_events_total", "Meter readings handed to Kafka")
+LATE_EVENTS = Counter("smartgrid_producer_late_events_total", "Readings sent with a backdated event time")
+SEND_ERRORS = Counter("smartgrid_producer_send_errors_total", "Readings Kafka failed to acknowledge")
 
 
 def _stop(signum, frame):  # noqa: ARG001 - signal handler signature
@@ -81,11 +88,21 @@ def main() -> int:
     jitter = float(cfg.grid["load_jitter_pct"])
     day_start, day_end = cfg.alerts["daytime_start_hour"], cfg.alerts["daytime_end_hour"]
 
+    metrics_port = int(cfg.raw["observability"]["producer_metrics_port"])
+    if metrics_port:
+        start_http_server(metrics_port)
+        log.info("metrics_endpoint", url="http://localhost:{}/metrics".format(metrics_port))
+
     producer = build_producer(cfg)
     topic = cfg.kafka_topic
     # run_id travels in a header, not the payload: it is metadata about the
     # pipeline run, not part of the meter reading contract.
     headers = [("run_id", run_id.encode("utf-8"))]
+
+    def on_send_error(exc: Exception) -> None:
+        """Kafka's delivery callback: a reading the broker never acknowledged."""
+        SEND_ERRORS.inc()
+        log.error("send_failed", error=str(exc))
 
     log.info("producer_ready", bootstrap=cfg.kafka_bootstrap, topic=topic,
              meters=len(meters), solar_meters=sum(m.has_solar for m in meters),
@@ -108,6 +125,7 @@ def main() -> int:
             if is_late:
                 event_time -= timedelta(minutes=rng.uniform(1.0, late_max_minutes))
                 late_sent += 1
+                LATE_EVENTS.inc()
 
             reading = make_reading(
                 meter, event_time, interval_hours,
@@ -119,8 +137,9 @@ def main() -> int:
                 key=meter.household_id.encode("utf-8"),
                 value=json.dumps(reading).encode("utf-8"),
                 headers=headers,
-            )
+            ).add_errback(on_send_error)
             sent += 1
+            EVENTS_SENT.inc()
 
         ticks += 1
         producer.flush()

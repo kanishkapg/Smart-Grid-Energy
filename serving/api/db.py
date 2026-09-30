@@ -115,6 +115,24 @@ SELECT sim_day, household_id, grid_zone,
 """
 
 
+# --- observability: pipeline_runs (Phase 6) -------------------------------
+_RUN_COUNTS = """
+SELECT component, status, count(*) AS runs
+  FROM pipeline_runs
+ GROUP BY component, status
+"""
+
+# The newest *successful* billing run: a failed run's duration measures how
+# long it took to fail, which says nothing about how long billing takes.
+_LAST_BATCH_DURATION = """
+SELECT EXTRACT(EPOCH FROM (finished_at - started_at))::float AS seconds
+  FROM pipeline_runs
+ WHERE component = 'billing_batch' AND status = 'SUCCESS' AND finished_at IS NOT NULL
+ ORDER BY finished_at DESC
+ LIMIT 1
+"""
+
+
 def _query(dsn: str, sql: str, params: dict | None = None) -> list[dict[str, Any]]:
     with psycopg.connect(dsn, row_factory=dict_row) as conn, conn.cursor() as cur:
         cur.execute(sql, params or {})
@@ -149,6 +167,17 @@ def billed_days(dsn: str, limit: int) -> list[dict[str, Any]]:
 def bills_for_day(dsn: str, sim_day: str) -> list[dict[str, Any]]:
     """Every household's bill for one simulated day."""
     return _query(dsn, _BILLS_FOR_DAY, {"sim_day": sim_day})
+
+
+def run_counts(dsn: str) -> list[dict[str, Any]]:
+    """How many runs each component has recorded, by final status."""
+    return _query(dsn, _RUN_COUNTS)
+
+
+def last_batch_duration(dsn: str) -> float | None:
+    """Real seconds the newest successful billing run took; None if none yet."""
+    rows = _query(dsn, _LAST_BATCH_DURATION)
+    return rows[0]["seconds"] if rows else None
 
 
 def freshness(dsn: str) -> dict[str, Any]:
